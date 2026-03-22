@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{ops::Bound, path::PathBuf};
 
-const STORAGE_DIR: &str = "/usr/local/lethe/data";
+const STORAGE_DIR: &str = "/usr/local/pithos/data";
 const WAL_DIR: &str = "wal";
 const MAX_TABLE_SIZE: usize = 128 * 1024 * 1024;
 
