@@ -1,11 +1,14 @@
+use crate::index::IndexBuilder;
+use crate::sst::block::{Block, BlockBuilder};
+use crate::sst::{self, SSTable};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
+use crossbeam_skiplist::map::Iter;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{ops::Bound, path::PathBuf};
 
-const STORAGE_DIR: &str = "/usr/local/pithos/data";
 const WAL_DIR: &str = "wal";
 const MAX_TABLE_SIZE: usize = 128 * 1024 * 1024;
 
@@ -28,7 +31,7 @@ impl Default for TableOptions {
 }
 
 #[derive(Clone, Debug)]
-enum Value {
+pub(crate) enum Value {
     Plain(Bytes),
     Tombstone,
 }
@@ -123,8 +126,37 @@ impl Memtable {
     }
 
     pub(crate) fn freeze(&self) -> Result<(), MemError> {
+        let iter = self.store.iter();
+
         Ok(())
     }
+}
+
+pub(crate) fn build_sstable(
+    memtable_iter: Iter<'_, Bytes, Value>,
+    block_size: usize,
+) -> Result<SSTable, MemError> {
+    let mut block_builder = BlockBuilder::init(1, block_size);
+    let mut index_builder = IndexBuilder::builder();
+    memtable_iter.for_each(|entry| {
+        let key = entry.key().to_vec();
+        let value = match entry.value() {
+            Value::Plain(v) => v.to_vec(),
+            Value::Tombstone => vec![],
+        };
+
+        block_builder.encode_pair(&key, &value);
+        let block_offset = block_builder.latest_block_offset();
+        if let Some(key_offset) = block_builder.latest_key_offset() {
+            index_builder.add_entry(&key, block_offset, key_offset);
+        }
+    });
+    let blocks: Vec<Block> = block_builder.build();
+
+    let index_start_offset = blocks.iter().map(|b| b.size()).sum::<usize>() as u64;
+    let index = index_builder.build(index_start_offset);
+
+    SSTable::new(&blocks, &index, sst::MAX_TABLE_SIZE).map_err(|_| MemError::FreezeFailure)
 }
 
 #[cfg(test)]
@@ -259,5 +291,42 @@ mod tests {
         let result = std::fs::exists(expected_wal_dir);
         assert!(result.is_ok());
         assert!(result.unwrap());
+    }
+
+    #[test]
+    fn build_sstable_from_memtable_contents() {
+        let table = test_memtable();
+        let k1 = Bytes::from("1");
+        let v1 = Bytes::from("123");
+
+        let k2 = Bytes::from("2");
+        let v2 = Bytes::from("456");
+
+        let k3 = Bytes::from("3");
+        let v3 = Bytes::from("789");
+
+        let k4 = Bytes::from("4");
+        let v4 = Bytes::from("0000");
+
+        let _ = table.put(&k1, &v1);
+        let _ = table.put(&k2, &v2);
+        let _ = table.put(&k3, &v3);
+        let _ = table.put(&k4, &v4);
+
+        let result = build_sstable(table.store.iter(), 32);
+        assert!(result.is_ok());
+
+        let table: SSTable = result.unwrap();
+
+        assert_eq!(table.first_key, k1.to_vec());
+        assert_eq!(table.last_key, k4.to_vec());
+        assert_eq!(table.blocks.len(), 2);
+
+        let k1_idx = table.index.find_block_by_key(&k1).unwrap();
+        assert_eq!(k1_idx.offsets(), (0, 0));
+
+        let k4_idx = table.index.find_block_by_key(&k4).unwrap();
+        let first_block = table.blocks[0].clone();
+        assert_eq!(k4_idx.offsets(), (first_block.size() as u64, 0));
     }
 }
