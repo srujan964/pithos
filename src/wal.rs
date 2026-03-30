@@ -1,4 +1,4 @@
-use rkyv::{Archive, Deserialize, Serialize};
+use bytes::BufMut;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -7,23 +7,38 @@ use std::sync::Mutex;
 
 const WAL_FILE_PREFIX: &str = "wal-";
 const WAL_FILE_EXT: &str = ".log";
-const MAX_SEGMENT_SIZE: usize = 1024 * 1024 * 8;
+const MAX_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Archive)]
-#[rkyv(compare(PartialEq), derive(Debug))]
+#[derive(Debug, Clone, PartialEq)]
 enum Op {
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Archive)]
-#[rkyv(compare(PartialEq), derive(Debug))]
+impl From<&Op> for u8 {
+    fn from(val: &Op) -> Self {
+        match val {
+            Op::Put(_, _) => 0,
+            Op::Delete(_) => 1,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+#[non_exhaustive]
 enum WalVersion {
     V1 = 1,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Archive)]
-#[rkyv(compare(PartialEq), derive(Debug))]
+impl From<WalVersion> for u8 {
+    fn from(value: WalVersion) -> Self {
+        match value {
+            WalVersion::V1 => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct WalEntry {
     version: WalVersion,
     crc: u32,
@@ -73,24 +88,17 @@ impl WalWriter {
         let mut hasher = crc32fast::Hasher::new();
         match op {
             Op::Put(k, v) => {
+                hasher.update(&[op.into()]);
                 hasher.update(k);
                 hasher.update(v);
             }
             Op::Delete(k) => {
+                hasher.update(&[op.into()]);
                 hasher.update(k);
             }
         };
 
-        let entry = WalEntry {
-            version: WalVersion::V1,
-            crc: hasher.finalize(),
-            op: op.clone(),
-        };
-
-        let buf = match rkyv::to_bytes::<rkyv::rancor::Error>(&entry) {
-            Ok(b) => b,
-            Err(_) => return Err(WalError::WriteFailure),
-        };
+        let buf = encode(WalVersion::V1, hasher.finalize(), op);
 
         let mut file = self.file.lock().unwrap();
         match file.write(&buf) {
@@ -99,20 +107,44 @@ impl WalWriter {
         }
     }
 
-    pub(crate) fn flush(&self) -> Result<(), WalError> {
-        match self.file.lock() {
-            Ok(mut file) => {
-                let _ = file.flush();
-                Ok(())
-            }
-            Err(_) => Err(WalError::WriteFailure),
+    pub(crate) fn flush(&self) -> std::io::Result<()> {
+        let mut guard = self.file.lock().unwrap();
+        guard.flush()?;
+        Ok(())
+    }
+}
+
+fn encode(version: WalVersion, crc: u32, op: &Op) -> Vec<u8> {
+    let mut buf: Vec<u8> = vec![];
+
+    buf.put_u8(version.into());
+    buf.put_u32_le(crc);
+    buf.put_u8(op.into());
+
+    match op {
+        Op::Put(k, v) => {
+            let key_len = k.len();
+            buf.put_u16_le(key_len as u16);
+            buf.put(k as &[u8]);
+
+            let val_len = v.len();
+            buf.put_u16_le(val_len as u16);
+            buf.put(v as &[u8]);
+        }
+        Op::Delete(k) => {
+            let key_len = k.len();
+            buf.put_u16_le(key_len as u16);
+            buf.put(k as &[u8]);
         }
     }
+
+    buf
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Buf;
     use bytes::Bytes;
     use pretty_assertions::assert_eq;
     use temp_dir::TempDir;
@@ -145,29 +177,51 @@ mod tests {
 
         let key = Bytes::from("100");
         let value = Bytes::from("1234");
-        let op = Op::Put(key.to_vec(), value.to_vec());
+        let op_one = Op::Put(key.to_vec(), value.to_vec());
+        let op_two = Op::Delete(key.to_vec());
 
-        writer.write(&op)?;
+        writer.write(&op_one)?;
+        writer.write(&op_two)?;
         writer.flush()?;
 
         let contents = std::fs::read(wal_path).unwrap();
+        assert!(!contents.is_empty());
+
+        let mut buf: &[u8] = contents.as_ref();
+        assert_eq!(u8::from(WalVersion::V1), buf.get_u8());
+
         let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&[(&op_one).into()]);
         hasher.update(&key);
         hasher.update(&value);
         let expected_crc = hasher.finalize();
-        let expected_wal_entry = WalEntry {
-            version: WalVersion::V1,
-            crc: expected_crc,
-            op: op.clone(),
-        };
+        assert_eq!(expected_crc, buf.get_u32_le());
 
-        assert!(!contents.is_empty());
+        assert_eq!(u8::from(&op_one), buf.get_u8());
 
-        let archived = rkyv::access::<ArchivedWalEntry, rkyv::rancor::Error>(&contents).unwrap();
-        let deserialized_contents =
-            rkyv::deserialize::<WalEntry, rkyv::rancor::Error>(archived).unwrap();
+        let key_len = buf.get_u16_le() as usize;
+        assert_eq!(key, &buf[..key_len]);
+        buf.advance(key_len);
 
-        assert_eq!(deserialized_contents, expected_wal_entry);
+        let value_len = buf.get_u16_le() as usize;
+        assert_eq!(value, &buf[..value_len]);
+        buf.advance(value_len);
+
+        assert_eq!(u8::from(WalVersion::V1), buf.get_u8());
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&[(&op_two).into()]);
+        hasher.update(&key);
+        let expected_crc = hasher.finalize();
+        assert_eq!(expected_crc, buf.get_u32_le());
+
+        assert_eq!(u8::from(&op_two), buf.get_u8());
+
+        let key_len = buf.get_u16_le() as usize;
+        assert_eq!(key, &buf[..key_len]);
+        buf.advance(key_len);
+
+        assert!(buf.is_empty());
         Ok(())
     }
 }
