@@ -1,6 +1,7 @@
 use crate::index::IndexBuilder;
 use crate::sst::block::{Block, BlockBuilder};
 use crate::sst::{self, SSTable};
+use crate::storage;
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use crossbeam_skiplist::map::Iter;
@@ -10,15 +11,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{ops::Bound, path::PathBuf};
 
 const WAL_DIR: &str = "wal";
-const MAX_TABLE_SIZE: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_TABLE_SIZE: usize = 128 * 1024 * 1024;
 
+#[derive(Debug, Clone)]
 pub(crate) struct TableOptions {
-    max_size: usize,
+    pub(crate) max_size: usize,
+    pub(crate) data_dir: PathBuf,
 }
 
 impl TableOptions {
-    fn new(max_size: usize) -> Self {
-        Self { max_size }
+    pub(crate) fn new(max_size: usize, data_dir: &Path) -> Self {
+        Self {
+            max_size,
+            data_dir: data_dir.to_path_buf(),
+        }
     }
 }
 
@@ -26,6 +32,7 @@ impl Default for TableOptions {
     fn default() -> Self {
         Self {
             max_size: MAX_TABLE_SIZE,
+            data_dir: PathBuf::from(storage::DATA_DIR),
         }
     }
 }
@@ -36,9 +43,10 @@ pub(crate) enum Value {
     Tombstone,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Memtable {
     id: usize,
+    max_size: usize,
     size: Arc<AtomicUsize>,
     store: Arc<SkipMap<Bytes, Value>>,
     wal_dir: PathBuf,
@@ -54,6 +62,8 @@ pub(crate) enum MemError {
     InvalidRange,
     #[error("Unable to freeze memtable")]
     FreezeFailure,
+    #[error("Memtable size limit exceeded")]
+    MaxSizeExceeded,
 }
 
 fn create_wal_dir(path: &Path) -> Result<(), MemError> {
@@ -64,11 +74,27 @@ fn create_wal_dir(path: &Path) -> Result<(), MemError> {
     }
 }
 
-impl Memtable {
-    pub(crate) fn create(id: usize, data_dir: &Path) -> Memtable {
-        let _options = TableOptions::default();
+pub(crate) trait Buffer {
+    fn create(id: usize, options: Option<TableOptions>) -> Self;
 
-        let mut wal_dir = PathBuf::from(data_dir);
+    fn size(&self) -> usize;
+
+    fn put(&self, key: &Bytes, value: &Bytes) -> Result<usize, MemError>;
+
+    fn delete(&self, key: &Bytes) -> Result<(), MemError>;
+
+    fn get(&self, key: &Bytes) -> Option<Bytes>;
+
+    fn scan(&self, start: &Bytes, end: &Bytes) -> Result<Vec<(Bytes, Bytes)>, MemError>;
+
+    fn freeze(&self) -> Result<SSTable, MemError>;
+}
+
+impl Buffer for Memtable {
+    fn create(id: usize, options: Option<TableOptions>) -> Self {
+        let options = options.unwrap_or_default();
+
+        let mut wal_dir = options.data_dir;
         wal_dir.push(WAL_DIR);
         wal_dir.push(format!("{}", id));
 
@@ -79,35 +105,43 @@ impl Memtable {
 
         Memtable {
             id,
+            max_size: options.max_size,
             store: Arc::new(SkipMap::new()),
             size: Arc::new(0.into()),
             wal_dir,
         }
     }
 
-    pub(crate) fn put(&self, key: &Bytes, value: &Bytes) -> Result<(), MemError> {
-        let pair_size: usize = key.len() + value.len();
-        self.size.fetch_add(pair_size, Ordering::Relaxed);
-        self.store.insert(key.clone(), Value::Plain(value.clone()));
-        Ok(())
+    fn size(&self) -> usize {
+        self.size.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn get(&self, key: &Bytes) -> Option<Bytes> {
+    fn put(&self, key: &Bytes, value: &Bytes) -> Result<usize, MemError> {
+        let pair_size: usize = key.len() + value.len();
+        self.size.fetch_add(pair_size, Ordering::SeqCst);
+        self.store.insert(key.clone(), Value::Plain(value.clone()));
+        Ok(self.size.load(Ordering::SeqCst))
+    }
+
+    fn get(&self, key: &Bytes) -> Option<Bytes> {
         self.store.get(key).and_then(|v| match v.value() {
             Value::Plain(val) => Some(val.clone()),
             Value::Tombstone => None,
         })
     }
 
-    pub(crate) fn delete(&self, key: &Bytes) -> Result<(), MemError> {
+    fn delete(&self, key: &Bytes) -> Result<(), MemError> {
         match self.get(key) {
-            Some(_) => self.store.insert(key.clone(), Value::Tombstone),
+            Some(_) => {
+                self.size.fetch_add(key.len(), Ordering::Relaxed);
+                self.store.insert(key.clone(), Value::Tombstone);
+            }
             None => return Err(MemError::ValueTombstoned),
         };
         Ok(())
     }
 
-    pub(crate) fn scan(&self, start: &Bytes, end: &Bytes) -> Result<Vec<(Bytes, Bytes)>, MemError> {
+    fn scan(&self, start: &Bytes, end: &Bytes) -> Result<Vec<(Bytes, Bytes)>, MemError> {
         if start > end {
             return Err(MemError::InvalidRange);
         }
@@ -125,10 +159,8 @@ impl Memtable {
             .collect())
     }
 
-    pub(crate) fn freeze(&self) -> Result<(), MemError> {
-        let iter = self.store.iter();
-
-        Ok(())
+    fn freeze(&self) -> Result<SSTable, MemError> {
+        build_sstable(self.store.iter(), sst::BLOCK_SIZE)
     }
 }
 
@@ -167,7 +199,11 @@ mod tests {
 
     fn test_memtable() -> Memtable {
         let tempdir = TempDir::new();
-        Memtable::create(1, tempdir.unwrap().path())
+        let options = TableOptions {
+            data_dir: tempdir.unwrap().path().to_path_buf(),
+            max_size: 256,
+        };
+        Memtable::create(1, Some(options))
     }
 
     #[test]
@@ -283,7 +319,11 @@ mod tests {
     fn memtable_initializes_wal_directory() {
         let tempdir = TempDir::new().unwrap();
         let path = tempdir.path();
-        let _ = Memtable::create(1, path);
+        let options = TableOptions {
+            data_dir: path.to_path_buf(),
+            max_size: MAX_TABLE_SIZE,
+        };
+        let _ = Memtable::create(1, Some(options));
 
         let mut expected_wal_dir = PathBuf::from(path);
         expected_wal_dir.push("wal/1/");
@@ -328,5 +368,28 @@ mod tests {
         let k4_idx = table.index.find_block_by_key(&k4).unwrap();
         let first_block = table.blocks[0].clone();
         assert_eq!(k4_idx.offsets(), (first_block.size() as u64, 0));
+    }
+
+    #[test]
+    fn memtable_freeze_creates_sst() {
+        let table = test_memtable();
+        let k1 = Bytes::from("1");
+        let v1 = Bytes::from("123");
+
+        let k2 = Bytes::from("2");
+        let v2 = Bytes::from("456");
+
+        let k3 = Bytes::from("3");
+        let v3 = Bytes::from("789");
+
+        let _ = table.put(&k1, &v1);
+        let _ = table.put(&k2, &v2);
+        let _ = table.put(&k3, &v3);
+
+        let result = table.freeze();
+        assert!(result.is_ok());
+
+        let sst = result.unwrap();
+        assert_eq!(sst.blocks.len(), 1);
     }
 }

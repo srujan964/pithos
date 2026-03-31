@@ -10,6 +10,7 @@ thiserror="2.0.18"
 rkyv="0.8.15"
 crc32fast = "1.5.0"
 crossbeam-skiplist = "0.1.3"
+parking_lot = "0.12.5"
 
 [dev-dependencies]
 temp-dir="0.2.0"

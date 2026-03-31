@@ -3,6 +3,8 @@ use bytes::BufMut;
 
 pub(crate) const U16_SIZE: usize = std::mem::size_of::<u16>();
 pub(crate) const U64_SIZE: usize = std::mem::size_of::<u64>();
+
+pub(crate) const BLOCK_SIZE: usize = 4 * 1024;
 pub(crate) const MAX_TABLE_SIZE: usize = 64 * 1024 * 1024;
 pub(crate) const FOOTER_SIZE: usize = 4 * 1024;
 
