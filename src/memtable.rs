@@ -1,7 +1,6 @@
 use crate::index::IndexBuilder;
 use crate::sst::block::{Block, BlockBuilder};
 use crate::sst::{self, SSTable};
-use crate::storage;
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use crossbeam_skiplist::map::Iter;
@@ -32,7 +31,7 @@ impl Default for TableOptions {
     fn default() -> Self {
         Self {
             max_size: MAX_TABLE_SIZE,
-            data_dir: PathBuf::from(storage::DATA_DIR),
+            data_dir: PathBuf::from(crate::core::DATA_DIR),
         }
     }
 }
@@ -43,7 +42,7 @@ pub(crate) enum Value {
     Tombstone,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Memtable {
     id: usize,
     max_size: usize,

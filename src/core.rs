@@ -13,12 +13,12 @@ use std::vec;
 pub(crate) const DATA_DIR: &str = "/usr/local/pithos/data";
 
 #[derive(Clone, Debug)]
-pub struct StorageOptions {
-    data_dir: PathBuf,
-    max_memtable_size: usize,
+pub(crate) struct CoreOptions {
+    pub(crate) data_dir: PathBuf,
+    pub(crate) max_memtable_size: usize,
 }
 
-impl Default for StorageOptions {
+impl Default for CoreOptions {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from(DATA_DIR),
@@ -34,21 +34,21 @@ struct State<B> {
 }
 
 #[derive(Debug)]
-pub(crate) struct Storage<B> {
+pub(crate) struct CoreStorage<B> {
     cur_memtable_id: AtomicUsize,
     state: Arc<RwLock<Arc<State<B>>>>,
     freeze_lock: Mutex<()>,
-    options: StorageOptions,
+    options: CoreOptions,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum StorageError {
+pub(crate) enum OrchestrationError {
     #[error("Underlying storage system unavailable")]
     Unavailable,
 }
 
-impl<B: Buffer + Clone> Storage<B> {
-    pub(crate) fn new(options: Option<StorageOptions>) -> Self {
+impl<B: Buffer + Clone> CoreStorage<B> {
+    pub(crate) fn new(options: Option<CoreOptions>) -> Self {
         let memtable_id = 1;
         let options = options.unwrap_or_default();
         let table_options = TableOptions::new(options.max_memtable_size, &options.data_dir);
@@ -66,7 +66,7 @@ impl<B: Buffer + Clone> Storage<B> {
         }
     }
 
-    pub(crate) fn put(&self, key: Bytes, value: Bytes) -> Result<(), StorageError> {
+    pub(crate) fn put(&self, key: Bytes, value: Bytes) -> Result<(), OrchestrationError> {
         let guard = self.state.read().unwrap();
 
         match guard.memtable.put(&key, &value) {
@@ -75,11 +75,11 @@ impl<B: Buffer + Clone> Storage<B> {
                 self.try_freeze_memtable()
             }
             Ok(_) => Ok(()),
-            Err(_) => Err(StorageError::Unavailable),
+            Err(_) => Err(OrchestrationError::Unavailable),
         }
     }
 
-    pub(crate) fn get(&self, key: Bytes) -> Result<Bytes, StorageError> {
+    pub(crate) fn get(&self, key: Bytes) -> Result<Bytes, OrchestrationError> {
         let guard = self.state.read().unwrap();
 
         if let Some(value) = guard.memtable.get(&key) {
@@ -92,20 +92,20 @@ impl<B: Buffer + Clone> Storage<B> {
             }
         }
 
-        Err(StorageError::Unavailable)
+        Err(OrchestrationError::Unavailable)
     }
 
-    pub(crate) fn delete(&self, key: Bytes) -> Result<(), StorageError> {
+    pub(crate) fn delete(&self, key: Bytes) -> Result<(), OrchestrationError> {
         let guard = self.state.read().unwrap();
         guard
             .memtable
             .delete(&key)
-            .map_err(|_| StorageError::Unavailable)
+            .map_err(|_| OrchestrationError::Unavailable)
     }
 
     // Check if the current memtable has exceeded max capacity. If so, freeze it
     // and add it to the frozen list.
-    fn try_freeze_memtable(&self) -> Result<(), StorageError> {
+    fn try_freeze_memtable(&self) -> Result<(), OrchestrationError> {
         let _guard = self.freeze_lock.lock().unwrap();
         let read_state = self.state.read().unwrap();
 
@@ -213,13 +213,13 @@ mod tests {
         }
     }
 
-    fn init_storage<B: Buffer + Clone>(size: usize) -> Storage<B> {
+    fn init_storage<B: Buffer + Clone>(size: usize) -> CoreStorage<B> {
         let path = PathBuf::from("stub");
-        let options = StorageOptions {
+        let options = CoreOptions {
             max_memtable_size: size,
             data_dir: path,
         };
-        Storage::new(Some(options))
+        CoreStorage::new(Some(options))
     }
 
     #[test]
