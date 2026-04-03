@@ -1,8 +1,10 @@
 use crate::memtable::{self};
 use crate::memtable::{Buffer, TableOptions};
+use crate::sst::SSTable;
 use bytes::Bytes;
 use std::fmt::Debug;
 use std::path::PathBuf;
+use std::sync::MutexGuard;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -31,6 +33,7 @@ impl Default for CoreOptions {
 struct State<B> {
     memtable: Arc<B>,
     frozen: Vec<Arc<B>>,
+    level_zero: Vec<SSTable>,
 }
 
 #[derive(Debug)]
@@ -45,6 +48,10 @@ pub(crate) struct CoreStorage<B> {
 pub(crate) enum OrchestrationError {
     #[error("Underlying storage system unavailable")]
     Unavailable,
+    #[error("No frozen memtables found")]
+    NothingToFlush,
+    #[error("Failed to create SSTable")]
+    FlushFailure,
 }
 
 impl<B: Buffer + Clone> CoreStorage<B> {
@@ -56,6 +63,7 @@ impl<B: Buffer + Clone> CoreStorage<B> {
         let state = State {
             memtable: Arc::new(memtable),
             frozen: vec![],
+            level_zero: vec![],
         };
 
         Self {
@@ -103,13 +111,77 @@ impl<B: Buffer + Clone> CoreStorage<B> {
             .map_err(|_| OrchestrationError::Unavailable)
     }
 
+    // Freeze current memtable and continously flush all frozen memtables to disk.
+    pub(crate) fn force_flush_all(&self) -> Result<(), OrchestrationError> {
+        let _ = self.try_freeze_memtable();
+
+        let stack_lock = self.freeze_lock.lock().unwrap();
+        while {
+            let guard = self.state.read().unwrap();
+            !guard.frozen.is_empty()
+        } {
+            match self.flush_oldest_memtable(&stack_lock) {
+                Ok(_) => {}
+                Err(_) => {
+                    eprintln!("Error while flushing oldest memtable. It was possibly empty.");
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Flush the last memtable in the frozen list and pop it.
+    fn flush_oldest_memtable(
+        &self,
+        _state_lock: &MutexGuard<'_, ()>,
+    ) -> Result<(), OrchestrationError> {
+        let oldest;
+        {
+            let guard = self.state.read().unwrap();
+            match guard.frozen.last() {
+                Some(memtable) => oldest = memtable.clone(),
+                None => {
+                    drop(guard);
+                    return Err(OrchestrationError::NothingToFlush);
+                }
+            }
+        }
+
+        let sst = match oldest.flush() {
+            Ok(sst) => sst,
+            Err(_) => {
+                return Err(OrchestrationError::FlushFailure);
+            }
+        };
+
+        // Modify frozen state and add new SSTable to level 0.
+        {
+            let mut guard = self.state.write().unwrap();
+            let mut snapshot = guard.as_ref().clone();
+
+            match snapshot.frozen.pop() {
+                Some(_) => {}
+                None => {
+                    drop(guard);
+                    return Err(OrchestrationError::NothingToFlush);
+                }
+            };
+
+            snapshot.level_zero.insert(0, sst);
+            *guard = Arc::new(snapshot);
+        }
+
+        Ok(())
+    }
+
     // Check if the current memtable has exceeded max capacity. If so, freeze it
     // and add it to the frozen list.
     fn try_freeze_memtable(&self) -> Result<(), OrchestrationError> {
         let _guard = self.freeze_lock.lock().unwrap();
         let read_state = self.state.read().unwrap();
 
-        // if memetable was frozen already, do nothing
+        // If memtable was frozen already, do nothing.
         if read_state.memtable.size() >= self.options.max_memtable_size {
             drop(read_state);
 
@@ -125,14 +197,14 @@ impl<B: Buffer + Clone> CoreStorage<B> {
 
             {
                 let mut write_state = self.state.write().unwrap();
-
-                // Create a clone of current storage state
                 let mut snapshot = write_state.as_ref().clone();
 
-                // Replace current memtable with new one and add it to the immutable list
+                // Replace current memtable of the snapshot with the new one and add it to the
+                // frozen list.
                 let old = std::mem::replace(&mut snapshot.memtable, memtable);
                 snapshot.frozen.insert(0, old.clone());
 
+                // Point the storage state to the snapshot with the fresh memtable.
                 *write_state = Arc::new(snapshot);
             }
         }
@@ -149,9 +221,13 @@ impl<B: Buffer + Clone> CoreStorage<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{memtable::MemError, sst::SSTable};
+    use crate::{
+        memtable::{MemError, Memtable},
+        sst::SSTable,
+    };
     use bytes::Bytes;
     use std::path::PathBuf;
+    use temp_dir::TempDir;
 
     #[derive(Clone, Debug)]
     struct TestMemtable {
@@ -208,7 +284,7 @@ mod tests {
             }
         }
 
-        fn freeze(&self) -> Result<SSTable, MemError> {
+        fn flush(&self) -> Result<SSTable, MemError> {
             todo!()
         }
     }
@@ -282,7 +358,7 @@ mod tests {
                 todo!()
             }
 
-            fn freeze(&self) -> Result<SSTable, MemError> {
+            fn flush(&self) -> Result<SSTable, MemError> {
                 todo!()
             }
         }
@@ -291,5 +367,60 @@ mod tests {
 
         let result = storage.put(TEST_KEY.into(), TEST_VALUE.into());
         assert!(result.is_ok());
+    }
+
+    fn test_memtable() -> Memtable {
+        let tempdir = TempDir::new();
+        let options = TableOptions {
+            data_dir: tempdir.unwrap().path().to_path_buf(),
+            max_size: 256,
+        };
+        Memtable::create(1, Some(options))
+    }
+
+    #[test]
+    fn force_flush_memtable_empties_frozen_list_and_updates_level_zero() {
+        let memtable = test_memtable();
+        let frozen_table_one = test_memtable();
+        let frozen_table_two = test_memtable();
+
+        let key = Bytes::from("Key");
+        let value = Bytes::from("Value");
+
+        let _ = frozen_table_one.put(&key, &value);
+        let _ = frozen_table_one.delete(&key);
+
+        let _ = frozen_table_two.put(&key, &value);
+        let _ = frozen_table_two.delete(&key);
+
+        let _ = memtable.put(&key, &value);
+        let _ = memtable.delete(&key);
+
+        let state = State {
+            memtable: Arc::new(memtable),
+            frozen: vec![Arc::new(frozen_table_two), Arc::new(frozen_table_one)],
+            level_zero: vec![],
+        };
+
+        let storage = CoreStorage {
+            cur_memtable_id: AtomicUsize::new(1),
+            state: Arc::new(RwLock::new(Arc::new(state))),
+            freeze_lock: Mutex::new(()),
+            options: CoreOptions {
+                data_dir: "stub".into(),
+                max_memtable_size: 4,
+            },
+        };
+
+        let result = storage.force_flush_all();
+        assert!(result.is_ok());
+
+        let guard = storage.state.read().unwrap();
+        let frozen_tables = guard.frozen.clone();
+        let l0_sstables = guard.level_zero.clone();
+        drop(guard);
+
+        assert!(frozen_tables.is_empty());
+        assert_eq!(l0_sstables.len(), 3);
     }
 }

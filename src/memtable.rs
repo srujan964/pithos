@@ -86,7 +86,7 @@ pub(crate) trait Buffer {
 
     fn scan(&self, start: &Bytes, end: &Bytes) -> Result<Vec<(Bytes, Bytes)>, MemError>;
 
-    fn freeze(&self) -> Result<SSTable, MemError>;
+    fn flush(&self) -> Result<SSTable, MemError>;
 }
 
 impl Buffer for Memtable {
@@ -158,7 +158,7 @@ impl Buffer for Memtable {
             .collect())
     }
 
-    fn freeze(&self) -> Result<SSTable, MemError> {
+    fn flush(&self) -> Result<SSTable, MemError> {
         build_sstable(self.store.iter(), sst::BLOCK_SIZE)
     }
 }
@@ -385,7 +385,7 @@ mod tests {
         let _ = table.put(&k2, &v2);
         let _ = table.put(&k3, &v3);
 
-        let result = table.freeze();
+        let result = table.flush();
         assert!(result.is_ok());
 
         let sst = result.unwrap();

@@ -1,3 +1,4 @@
+pub mod api;
 mod core;
 mod index;
 mod memtable;
