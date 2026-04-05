@@ -138,21 +138,21 @@ pub mod storage {
             Storage { storage }
         }
 
-        pub fn get(&self, key: String) -> Option<Value> {
+        pub fn get(&self, key: Vec<u8>) -> Option<Value> {
             match self.storage.get(Bytes::from(key)) {
                 Ok(bytes) => Value::from_bytes(bytes.to_vec()).ok(),
                 Err(_) => None,
             }
         }
 
-        pub fn put(&self, key: String, value: Value) -> Result<(), StorageError> {
+        pub fn put(&self, key: Vec<u8>, value: Value) -> Result<(), StorageError> {
             let value = value.as_bytes();
             self.storage
                 .put(Bytes::from(key), Bytes::from(value))
                 .map_err(|_| StorageError::InsertFailed)
         }
 
-        pub fn delete(&self, key: String) -> Result<(), StorageError> {
+        pub fn delete(&self, key: Vec<u8>) -> Result<(), StorageError> {
             self.storage
                 .delete(Bytes::from(key))
                 .map_err(|_| StorageError::DeleteFailed)
