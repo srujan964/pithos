@@ -290,10 +290,11 @@ mod tests {
     }
 
     fn init_storage<B: Buffer + Clone>(size: usize) -> CoreStorage<B> {
-        let path = PathBuf::from("stub");
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path();
         let options = CoreOptions {
             max_memtable_size: size,
-            data_dir: path,
+            data_dir: path.to_path_buf(),
         };
         CoreStorage::new(Some(options))
     }
@@ -402,12 +403,13 @@ mod tests {
             level_zero: vec![],
         };
 
+        let tempdir = TempDir::new().unwrap();
         let storage = CoreStorage {
             cur_memtable_id: AtomicUsize::new(1),
             state: Arc::new(RwLock::new(Arc::new(state))),
             freeze_lock: Mutex::new(()),
             options: CoreOptions {
-                data_dir: "stub".into(),
+                data_dir: tempdir.path().to_path_buf(),
                 max_memtable_size: 4,
             },
         };
