@@ -1,13 +1,18 @@
 use crate::index::IndexBuilder;
+use crate::iterator::StorageIter;
 use crate::sst::block::{Block, BlockBuilder};
 use crate::sst::{self, SSTable};
+
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
-use crossbeam_skiplist::map::Iter;
+use crossbeam_skiplist::map::{Iter, Range};
+use ouroboros::self_referencing;
+
+use std::ops::Bound;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{ops::Bound, path::PathBuf};
 
 const WAL_DIR: &str = "wal";
 pub(crate) const MAX_TABLE_SIZE: usize = 128 * 1024 * 1024;
@@ -36,7 +41,7 @@ impl Default for TableOptions {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Value {
     Plain(Bytes),
     Tombstone,
@@ -84,7 +89,7 @@ pub(crate) trait Buffer {
 
     fn get(&self, key: &Bytes) -> Option<Bytes>;
 
-    fn scan(&self, start: &Bytes, end: &Bytes) -> Result<Vec<(Bytes, Bytes)>, MemError>;
+    fn scan(&self, start: Bound<Bytes>, end: Bound<Bytes>) -> MemtableIterator;
 
     fn flush(&self) -> Result<SSTable, MemError>;
 }
@@ -123,43 +128,83 @@ impl Buffer for Memtable {
     }
 
     fn get(&self, key: &Bytes) -> Option<Bytes> {
-        self.store.get(key).and_then(|v| match v.value() {
+        self.store.get(key).and_then(|entry| match entry.value() {
             Value::Plain(val) => Some(val.clone()),
             Value::Tombstone => None,
         })
     }
 
     fn delete(&self, key: &Bytes) -> Result<(), MemError> {
-        match self.get(key) {
-            Some(_) => {
+        self.get(key)
+            .map(|_| {
                 self.size.fetch_add(key.len(), Ordering::Relaxed);
                 self.store.insert(key.clone(), Value::Tombstone);
-            }
-            None => return Err(MemError::ValueTombstoned),
-        };
-        Ok(())
+            })
+            .ok_or(MemError::ValueTombstoned)
     }
 
-    fn scan(&self, start: &Bytes, end: &Bytes) -> Result<Vec<(Bytes, Bytes)>, MemError> {
-        if start > end {
-            return Err(MemError::InvalidRange);
-        }
-
-        Ok(self
-            .store
-            .range::<Bytes, (Bound<&Bytes>, Bound<&Bytes>)>((
-                Bound::Included(start),
-                Bound::Included(end),
-            ))
-            .filter_map(|entry| match entry.value() {
-                Value::Plain(value) => Some((entry.key().clone(), value.clone())),
-                Value::Tombstone => None,
-            })
-            .collect())
+    fn scan(&self, start: Bound<Bytes>, end: Bound<Bytes>) -> MemtableIterator {
+        MemtableIterator::range(self.store.clone(), start, end)
     }
 
     fn flush(&self) -> Result<SSTable, MemError> {
         build_sstable(self.store.iter(), sst::BLOCK_SIZE)
+    }
+}
+
+type SkipMapRange<'a> = Range<'a, Bytes, (Bound<Bytes>, Bound<Bytes>), Bytes, Value>;
+
+#[self_referencing]
+#[derive(Debug)]
+pub(crate) struct MemtableIterator {
+    map: Arc<SkipMap<Bytes, Value>>,
+    #[borrows(map)]
+    #[not_covariant]
+    inner: SkipMapRange<'this>,
+    current: Option<(Bytes, Value)>,
+}
+
+impl MemtableIterator {
+    pub(crate) fn from_map(map: Arc<SkipMap<Bytes, Value>>) -> Self {
+        MemtableIteratorBuilder {
+            map,
+            inner_builder: |map| map.range((Bound::Unbounded, Bound::Unbounded)),
+            current: None,
+        }
+        .build()
+    }
+
+    pub(crate) fn range(
+        map: Arc<SkipMap<Bytes, Value>>,
+        start: Bound<Bytes>,
+        end: Bound<Bytes>,
+    ) -> Self {
+        MemtableIteratorBuilder {
+            map,
+            inner_builder: |map| map.range((start, end)),
+            current: None,
+        }
+        .build()
+    }
+}
+
+impl StorageIter for MemtableIterator {
+    type KeyVal = (Bytes, Value);
+
+    fn next(&mut self) -> Option<Self::KeyVal> {
+        std::iter::Iterator::next(self)
+    }
+}
+
+impl Iterator for MemtableIterator {
+    type Item = (Bytes, Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.with_inner_mut(|inner| {
+            inner
+                .next()
+                .map(|item| (item.key().clone(), item.value().clone()))
+        })
     }
 }
 
@@ -246,75 +291,6 @@ mod tests {
     }
 
     #[test]
-    fn memtable_returns_vec_of_key_value_pairs_when_scanned() {
-        let table = test_memtable();
-        let k1 = Bytes::from("1");
-        let v1 = Bytes::from("123");
-
-        let k2 = Bytes::from("2");
-        let v2 = Bytes::from("456");
-
-        let k3 = Bytes::from("3");
-        let v3 = Bytes::from("789");
-
-        let k4 = Bytes::from("4");
-        let v4 = Bytes::from("0000");
-
-        let _ = table.put(&k1, &v1);
-        let _ = table.put(&k2, &v2);
-        let _ = table.put(&k3, &v3);
-        let _ = table.put(&k4, &v4);
-
-        let result = table.scan(&k2, &k4);
-        assert!(result.is_ok());
-
-        let pairs = result.unwrap();
-        let mut iter = pairs.iter();
-        assert_eq!(iter.next(), Some(&(k2, v2)));
-        assert_eq!(iter.next(), Some(&(k3, v3)));
-        assert_eq!(iter.next(), Some(&(k4, v4)));
-    }
-
-    #[test]
-    fn memtable_returns_err_if_scan_end_lesser_than_start() {
-        let table = test_memtable();
-        let k1 = Bytes::from("1");
-        let v1 = Bytes::from("123");
-
-        let k2 = Bytes::from("2");
-        let v2 = Bytes::from("456");
-
-        let k3 = Bytes::from("3");
-        let v3 = Bytes::from("789");
-
-        let _ = table.put(&k1, &v1);
-        let _ = table.put(&k2, &v2);
-        let _ = table.put(&k3, &v3);
-
-        let result = table.scan(&k3, &k1);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn memtable_returns_empty_vec_if_unseen_keys_scanned() {
-        let table = test_memtable();
-        let k1 = Bytes::from("1");
-        let v1 = Bytes::from("123");
-
-        let k2 = Bytes::from("2");
-        let v2 = Bytes::from("456");
-
-        let _ = table.put(&k1, &v1);
-        let _ = table.put(&k2, &v2);
-
-        let result = table.scan(&Bytes::from("s1"), &Bytes::from("s2"));
-        assert!(result.is_ok());
-
-        let pairs = result.unwrap();
-        assert!(pairs.is_empty());
-    }
-
-    #[test]
     fn memtable_initializes_wal_directory() {
         let tempdir = TempDir::new().unwrap();
         let path = tempdir.path();
@@ -390,5 +366,70 @@ mod tests {
 
         let sst = result.unwrap();
         assert_eq!(sst.blocks.len(), 1);
+    }
+
+    #[test]
+    fn memtable_iter_iterates_through_all_elements_and_exhausts_itself() {
+        let map: SkipMap<Bytes, Value> = SkipMap::new();
+        map.insert(
+            Bytes::from("key_1"),
+            Value::Plain(Bytes::from("key_1_value")),
+        );
+        map.insert(
+            Bytes::from("key_2"),
+            Value::Plain(Bytes::from("key_2_value")),
+        );
+        map.insert(
+            Bytes::from("key_3"),
+            Value::Plain(Bytes::from("key_3_value")),
+        );
+        map.insert(Bytes::from("key_4"), Value::Tombstone);
+
+        let mut iter = MemtableIterator::from_map(Arc::new(map));
+
+        let first = Iterator::next(&mut iter).unwrap();
+        assert_eq!(Bytes::from("key_1"), first.0);
+        assert_eq!(Value::Plain(Bytes::from("key_1_value")), first.1);
+
+        let second = Iterator::next(&mut iter).unwrap();
+        assert_eq!(Bytes::from("key_2"), second.0);
+        assert_eq!(Value::Plain(Bytes::from("key_2_value")), second.1);
+
+        let third = Iterator::next(&mut iter).unwrap();
+        assert_eq!(Bytes::from("key_3"), third.0);
+        assert_eq!(Value::Plain(Bytes::from("key_3_value")), third.1);
+
+        let fourth = Iterator::next(&mut iter).unwrap();
+        assert_eq!(Bytes::from("key_4"), fourth.0);
+        assert_eq!(Value::Tombstone, fourth.1);
+    }
+
+    #[test]
+    fn memtable_iter_iteratres_over_provided_map_by_range() {
+        let map = SkipMap::new();
+        let lower = 4u8;
+        let upper = 15u8;
+        for v in 0u8..=30u8 {
+            let key = Bytes::from(vec![v]);
+            let value = Bytes::from(vec![v]);
+            map.insert(key, Value::Plain(value));
+        }
+
+        let lower_bound = Bound::Included(Bytes::from(vec![lower]));
+        let upper_bound = Bound::Included(Bytes::from(vec![upper]));
+
+        let mut iter: MemtableIterator =
+            MemtableIterator::range(Arc::new(map), lower_bound, upper_bound);
+        for i in lower..=upper {
+            match Iterator::next(&mut iter) {
+                Some(item) => {
+                    let expected_key = Bytes::from(vec![i]);
+                    let expected_value = Bytes::from(vec![i]);
+                    assert_eq!(expected_key, item.0.clone());
+                    assert_eq!(Value::Plain(expected_value), item.1.clone());
+                }
+                None => panic!(""),
+            }
+        }
     }
 }

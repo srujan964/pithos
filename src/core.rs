@@ -1,15 +1,18 @@
-use crate::memtable::{self};
-use crate::memtable::{Buffer, TableOptions};
+use crate::iterator::merge_iterator::MergeIterator;
+use crate::memtable::{self, Buffer, MemtableIterator, TableOptions, Value};
 use crate::sst::SSTable;
+
+use arc_swap::ArcSwap;
 use bytes::Bytes;
+
+use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::ops::Bound;
 use std::path::PathBuf;
-use std::sync::MutexGuard;
 use std::sync::{
-    Arc,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicUsize, Ordering},
 };
-use std::sync::{Mutex, RwLock};
 use std::vec;
 
 pub(crate) const DATA_DIR: &str = "/usr/local/pithos/data";
@@ -18,6 +21,7 @@ pub(crate) const DATA_DIR: &str = "/usr/local/pithos/data";
 pub(crate) struct CoreOptions {
     pub(crate) data_dir: PathBuf,
     pub(crate) max_memtable_size: usize,
+    pub(crate) memtable_limit: usize,
 }
 
 impl Default for CoreOptions {
@@ -25,6 +29,7 @@ impl Default for CoreOptions {
         Self {
             data_dir: PathBuf::from(DATA_DIR),
             max_memtable_size: memtable::MAX_TABLE_SIZE,
+            memtable_limit: 3,
         }
     }
 }
@@ -32,14 +37,49 @@ impl Default for CoreOptions {
 #[derive(Debug, Clone)]
 struct State<B> {
     memtable: Arc<B>,
-    frozen: Vec<Arc<B>>,
+    frozen: VecDeque<Arc<B>>,
     level_zero: Vec<SSTable>,
+}
+
+impl<B: Buffer> State<B> {
+    fn freeze(&self, _state_lock: &MutexGuard<'_, ()>, new_memtable: B) -> Self {
+        let old = Arc::clone(&self.memtable);
+
+        let mut frozen = self.frozen.clone();
+        frozen.push_back(old);
+
+        Self {
+            memtable: Arc::new(new_memtable),
+            frozen,
+            level_zero: self.level_zero.clone(),
+        }
+    }
+
+    fn flush_oldest(&self, sst: SSTable) -> Result<Self, OrchestrationError> {
+        let mut level_zero = self.level_zero.clone();
+        let mut frozen = self.frozen.clone();
+
+        match frozen.pop_back() {
+            Some(_) => {}
+            None => {
+                return Err(OrchestrationError::NothingToFlush);
+            }
+        }
+
+        level_zero.insert(0, sst);
+        let new = Self {
+            memtable: self.memtable.clone(),
+            frozen,
+            level_zero,
+        };
+        Ok(new)
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct CoreStorage<B> {
     cur_memtable_id: AtomicUsize,
-    state: Arc<RwLock<Arc<State<B>>>>,
+    state: Arc<ArcSwap<State<B>>>,
     freeze_lock: Mutex<()>,
     options: CoreOptions,
 }
@@ -62,38 +102,35 @@ impl<B: Buffer + Clone> CoreStorage<B> {
         let memtable = B::create(memtable_id, Some(table_options));
         let state = State {
             memtable: Arc::new(memtable),
-            frozen: vec![],
+            frozen: VecDeque::new(),
             level_zero: vec![],
         };
 
         Self {
             cur_memtable_id: AtomicUsize::new(memtable_id),
-            state: Arc::new(RwLock::new(Arc::new(state))),
+            state: Arc::new(ArcSwap::new(Arc::new(state))),
             freeze_lock: Mutex::new(()),
             options: options.clone(),
         }
     }
 
     pub(crate) fn put(&self, key: Bytes, value: Bytes) -> Result<(), OrchestrationError> {
-        let guard = self.state.read().unwrap();
+        let state = self.state.load();
 
-        match guard.memtable.put(&key, &value) {
-            Ok(size) if size >= self.options.max_memtable_size => {
-                drop(guard);
-                self.try_freeze_memtable()
-            }
+        match state.memtable.put(&key, &value) {
+            Ok(size) if size >= self.options.max_memtable_size => self.try_freeze(),
             Ok(_) => Ok(()),
             Err(_) => Err(OrchestrationError::Unavailable),
         }
     }
 
     pub(crate) fn get(&self, key: Bytes) -> Result<Bytes, OrchestrationError> {
-        let guard = self.state.read().unwrap();
+        let state = self.state.load();
 
-        if let Some(value) = guard.memtable.get(&key) {
+        if let Some(value) = state.memtable.get(&key) {
             return Ok(value);
         } else {
-            for immutable_table in guard.frozen.clone() {
+            for immutable_table in state.frozen.clone() {
                 if let Some(value) = immutable_table.get(&key) {
                     return Ok(value);
                 }
@@ -104,23 +141,61 @@ impl<B: Buffer + Clone> CoreStorage<B> {
     }
 
     pub(crate) fn delete(&self, key: Bytes) -> Result<(), OrchestrationError> {
-        let guard = self.state.read().unwrap();
-        guard
+        let state = self.state.load();
+
+        state
             .memtable
             .delete(&key)
             .map_err(|_| OrchestrationError::Unavailable)
     }
 
+    pub(crate) fn scan(&self, start: Bytes, end: Bytes) -> MergeIterator<MemtableIterator> {
+        let state = self.state.load();
+        let lower_bound = Bound::Included(start);
+        let upper_bound = Bound::Included(end);
+        let mut iters: VecDeque<MemtableIterator> = VecDeque::with_capacity(state.frozen.len() + 1);
+
+        iters.push_back(
+            state
+                .memtable
+                .scan(lower_bound.clone(), upper_bound.clone()),
+        );
+
+        for memtable in state.frozen.iter() {
+            iters.push_back(memtable.scan(lower_bound.clone(), upper_bound.clone()));
+        }
+
+        MergeIterator::new(iters)
+    }
+
+    fn try_freeze(&self) -> Result<(), OrchestrationError> {
+        let state_lock = self.freeze_lock.lock().unwrap();
+        let state = self.state.load_full();
+
+        if state.memtable.size() >= self.options.max_memtable_size {
+            let memtable: B = B::create(
+                self.next_memtable_id(),
+                Some(TableOptions::new(
+                    self.options.max_memtable_size,
+                    &self.options.data_dir,
+                )),
+            );
+
+            let new_state = self.state.load_full().freeze(&state_lock, memtable);
+            self.state.store(Arc::new(new_state));
+        }
+
+        Ok(())
+    }
+
     // Freeze current memtable and continously flush all frozen memtables to disk.
     pub(crate) fn force_flush_all(&self) -> Result<(), OrchestrationError> {
-        let _ = self.try_freeze_memtable();
+        let _ = self.try_freeze();
 
-        let stack_lock = self.freeze_lock.lock().unwrap();
-        while {
-            let guard = self.state.read().unwrap();
-            !guard.frozen.is_empty()
-        } {
-            match self.flush_oldest_memtable(&stack_lock) {
+        let state_lock = self.freeze_lock.lock().unwrap();
+        let state = self.state.load_full();
+        while !state.frozen.is_empty() {
+            match self.flush_oldest_memtable(&state_lock) {
                 Ok(_) => {}
                 Err(_) => {
                     eprintln!("Error while flushing oldest memtable. It was possibly empty.");
@@ -137,14 +212,11 @@ impl<B: Buffer + Clone> CoreStorage<B> {
         _state_lock: &MutexGuard<'_, ()>,
     ) -> Result<(), OrchestrationError> {
         let oldest;
-        {
-            let guard = self.state.read().unwrap();
-            match guard.frozen.last() {
-                Some(memtable) => oldest = memtable.clone(),
-                None => {
-                    drop(guard);
-                    return Err(OrchestrationError::NothingToFlush);
-                }
+        let state = self.state.load();
+        match state.frozen.back() {
+            Some(memtable) => oldest = memtable.clone(),
+            None => {
+                return Err(OrchestrationError::NothingToFlush);
             }
         }
 
@@ -155,61 +227,9 @@ impl<B: Buffer + Clone> CoreStorage<B> {
             }
         };
 
-        // Modify frozen state and add new SSTable to level 0.
-        {
-            let mut guard = self.state.write().unwrap();
-            let mut snapshot = guard.as_ref().clone();
-
-            match snapshot.frozen.pop() {
-                Some(_) => {}
-                None => {
-                    drop(guard);
-                    return Err(OrchestrationError::NothingToFlush);
-                }
-            };
-
-            snapshot.level_zero.insert(0, sst);
-            *guard = Arc::new(snapshot);
-        }
-
-        Ok(())
-    }
-
-    // Check if the current memtable has exceeded max capacity. If so, freeze it
-    // and add it to the frozen list.
-    fn try_freeze_memtable(&self) -> Result<(), OrchestrationError> {
-        let _guard = self.freeze_lock.lock().unwrap();
-        let read_state = self.state.read().unwrap();
-
-        // If memtable was frozen already, do nothing.
-        if read_state.memtable.size() >= self.options.max_memtable_size {
-            drop(read_state);
-
-            // Create the new memtable before acquiring a write lock on the storage state.
-            // Then we can swap the current memtable with a new one.
-            let memtable: Arc<B> = Arc::new(B::create(
-                self.next_memtable_id(),
-                Some(TableOptions::new(
-                    self.options.max_memtable_size,
-                    &self.options.data_dir,
-                )),
-            ));
-
-            {
-                let mut write_state = self.state.write().unwrap();
-                let mut snapshot = write_state.as_ref().clone();
-
-                // Replace current memtable of the snapshot with the new one and add it to the
-                // frozen list.
-                let old = std::mem::replace(&mut snapshot.memtable, memtable);
-                snapshot.frozen.insert(0, old.clone());
-
-                // Point the storage state to the snapshot with the fresh memtable.
-                *write_state = Arc::new(snapshot);
-            }
-        }
-
-        Ok(())
+        state.flush_oldest(sst).map(|updated| {
+            self.state.swap(Arc::new(updated));
+        })
     }
 
     fn next_memtable_id(&self) -> usize {
@@ -220,13 +240,14 @@ impl<B: Buffer + Clone> CoreStorage<B> {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound;
+
     use super::*;
     use crate::{
         memtable::{MemError, Memtable},
         sst::SSTable,
     };
     use bytes::Bytes;
-    use std::path::PathBuf;
     use temp_dir::TempDir;
 
     #[derive(Clone, Debug)]
@@ -236,8 +257,6 @@ mod tests {
 
     const TEST_KEY: &str = "test_key";
     const TEST_VALUE: &str = "test_value";
-    const TEST_KEY_2: &str = "test_key_2";
-    const TEST_VALUE_2: &str = "test_value_2";
 
     impl Buffer for TestMemtable {
         fn create(_id: usize, _options: Option<TableOptions>) -> Self {
@@ -273,15 +292,8 @@ mod tests {
             }
         }
 
-        fn scan(&self, start: &Bytes, end: &Bytes) -> Result<Vec<(Bytes, Bytes)>, MemError> {
-            if start.eq(TEST_KEY) && end.eq(TEST_KEY_2) {
-                Ok(vec![
-                    (Bytes::from(TEST_KEY), Bytes::from(TEST_VALUE)),
-                    (Bytes::from(TEST_KEY_2), Bytes::from(TEST_VALUE_2)),
-                ])
-            } else {
-                Err(MemError::InvalidRange)
-            }
+        fn scan(&self, _start: Bound<Bytes>, _end: Bound<Bytes>) -> MemtableIterator {
+            todo!()
         }
 
         fn flush(&self) -> Result<SSTable, MemError> {
@@ -295,6 +307,7 @@ mod tests {
         let options = CoreOptions {
             max_memtable_size: size,
             data_dir: path.to_path_buf(),
+            memtable_limit: 3,
         };
         CoreStorage::new(Some(options))
     }
@@ -355,7 +368,7 @@ mod tests {
                 todo!()
             }
 
-            fn scan(&self, _start: &Bytes, _end: &Bytes) -> Result<Vec<(Bytes, Bytes)>, MemError> {
+            fn scan(&self, _start: Bound<Bytes>, _end: Bound<Bytes>) -> MemtableIterator {
                 todo!()
             }
 
@@ -397,32 +410,86 @@ mod tests {
         let _ = memtable.put(&key, &value);
         let _ = memtable.delete(&key);
 
+        let mut q = VecDeque::new();
+        q.push_back(Arc::new(frozen_table_one));
+        q.push_back(Arc::new(frozen_table_two));
         let state = State {
             memtable: Arc::new(memtable),
-            frozen: vec![Arc::new(frozen_table_two), Arc::new(frozen_table_one)],
+            frozen: q,
             level_zero: vec![],
         };
 
         let tempdir = TempDir::new().unwrap();
         let storage = CoreStorage {
             cur_memtable_id: AtomicUsize::new(1),
-            state: Arc::new(RwLock::new(Arc::new(state))),
+            state: Arc::new(ArcSwap::new(Arc::new(state))),
             freeze_lock: Mutex::new(()),
             options: CoreOptions {
                 data_dir: tempdir.path().to_path_buf(),
                 max_memtable_size: 4,
+                memtable_limit: 3,
             },
         };
 
         let result = storage.force_flush_all();
         assert!(result.is_ok());
 
-        let guard = storage.state.read().unwrap();
-        let frozen_tables = guard.frozen.clone();
-        let l0_sstables = guard.level_zero.clone();
-        drop(guard);
+        let state = storage.state.load_full();
+        let frozen_tables = state.frozen.clone();
+        let l0_sstables = state.level_zero.clone();
 
         assert!(frozen_tables.is_empty());
         assert_eq!(l0_sstables.len(), 3);
+    }
+
+    #[test]
+    fn scan_creates_an_iterator_over_memtables() {
+        let memtable = test_memtable();
+        let intermediate_table = test_memtable();
+        let oldest_table = test_memtable();
+
+        let key = Bytes::from("key_1");
+        let key_2 = Bytes::from("key_2");
+        let key_3 = Bytes::from("key_3");
+        let value_1 = Bytes::from("value_1");
+        let value_2 = Bytes::from("value_2");
+        let value_3 = Bytes::from("value_3");
+
+        let _ = oldest_table.put(&key, &value_1);
+        let _ = oldest_table.put(&key_2, &value_2);
+
+        let _ = intermediate_table.put(&key, &value_2);
+        let _ = intermediate_table.put(&key_3, &value_2);
+        let _ = intermediate_table.delete(&key);
+
+        let _ = memtable.put(&key, &value_3);
+        let _ = memtable.put(&key_3, &value_1);
+
+        let mut q = VecDeque::new();
+        q.push_back(Arc::new(intermediate_table));
+        q.push_back(Arc::new(oldest_table));
+        let state = State {
+            memtable: Arc::new(memtable),
+            frozen: q,
+            level_zero: vec![],
+        };
+
+        let tempdir = TempDir::new().unwrap();
+        let storage = CoreStorage {
+            cur_memtable_id: AtomicUsize::new(1),
+            state: Arc::new(ArcSwap::new(Arc::new(state))),
+            freeze_lock: Mutex::new(()),
+            options: CoreOptions {
+                data_dir: tempdir.path().to_path_buf(),
+                max_memtable_size: 4,
+                memtable_limit: 3,
+            },
+        };
+
+        let mut iter = storage.scan(key.clone(), key_3.clone());
+
+        assert_eq!(iter.next().unwrap(), (key, Value::Plain(value_3)));
+        assert_eq!(iter.next().unwrap(), (key_2, Value::Plain(value_2)));
+        assert_eq!(iter.next().unwrap(), (key_3, Value::Plain(value_1)));
     }
 }

@@ -96,14 +96,19 @@ pub mod storage {
     use crate::{
         api::types::Value,
         core::{CoreOptions, CoreStorage},
-        memtable::Memtable,
+        iterator::merge_iterator::MergeIterator,
+        memtable::{self, Memtable, MemtableIterator},
     };
+
     use bytes::Bytes;
+
+    const NUM_MEMTABLE_LIMIT: usize = 3;
 
     #[derive(Clone, Debug)]
     pub struct StorageOptions {
         data_dir: String,
         max_memtable_size: usize,
+        memtable_limit: usize,
     }
 
     impl StorageOptions {
@@ -111,6 +116,7 @@ pub mod storage {
             StorageOptions {
                 data_dir,
                 max_memtable_size,
+                memtable_limit: NUM_MEMTABLE_LIMIT,
             }
         }
     }
@@ -128,11 +134,32 @@ pub mod storage {
         storage: CoreStorage<Memtable>,
     }
 
+    type IteratorInner = MergeIterator<MemtableIterator>;
+
+    pub struct Iterator {
+        inner: IteratorInner,
+    }
+
+    impl std::iter::Iterator for crate::api::storage::Iterator {
+        type Item = (Vec<u8>, Vec<u8>);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            match self.inner.next() {
+                Some((k, v)) => match v {
+                    memtable::Value::Plain(v) => Some((k.to_vec(), v.to_vec())),
+                    memtable::Value::Tombstone => Some((k.to_vec(), vec![])),
+                },
+                None => None,
+            }
+        }
+    }
+
     impl Storage {
         pub fn open(options: StorageOptions) -> Storage {
             let storage: CoreStorage<Memtable> = CoreStorage::new(Some(CoreOptions {
                 data_dir: options.data_dir.into(),
                 max_memtable_size: options.max_memtable_size,
+                memtable_limit: options.memtable_limit,
             }));
 
             Storage { storage }
@@ -156,6 +183,12 @@ pub mod storage {
             self.storage
                 .delete(Bytes::from(key))
                 .map_err(|_| StorageError::DeleteFailed)
+        }
+
+        pub fn scan(&self, start: Vec<u8>, end: Vec<u8>) -> crate::api::storage::Iterator {
+            crate::api::storage::Iterator {
+                inner: self.storage.scan(Bytes::from(start), Bytes::from(end)),
+            }
         }
 
         pub fn close(&self) -> Result<(), StorageError> {
