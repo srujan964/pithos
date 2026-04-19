@@ -1,4 +1,8 @@
-use crate::{index::Index, sst::block::Block};
+use crate::{
+    filter::{Filter, bloom::Bloom},
+    index::{Index, IndexBuilder},
+    sst::block::{Block, BlockBuilder},
+};
 use bytes::BufMut;
 
 pub(crate) const U16_SIZE: usize = std::mem::size_of::<u16>();
@@ -14,6 +18,7 @@ pub(crate) struct SSTable {
     pub(crate) index: Index,
     pub(crate) first_key: Vec<u8>,
     pub(crate) last_key: Vec<u8>,
+    pub(crate) filter: Bloom,
     pub(crate) max_size: usize,
     pub(crate) footer: TableFooter,
 }
@@ -33,10 +38,21 @@ pub(crate) enum SSTableError {
 
 impl SSTable {
     pub(crate) fn new(
-        blocks: &[Block],
-        index: &Index,
+        block_builder: &mut BlockBuilder,
+        index_builder: &mut IndexBuilder,
         max_size: usize,
     ) -> Result<Self, SSTableError> {
+        let blocks: Vec<Block> = block_builder.build();
+        let index_start_offset = blocks.iter().map(|b| b.size()).sum::<usize>() as u64;
+        let index = index_builder.build(index_start_offset);
+        let key_hashes: Vec<u64> = block_builder
+            .keys()
+            .iter()
+            .map(|key| seahash::hash(key))
+            .collect();
+
+        let filter = Bloom::build(&key_hashes);
+
         match (index.first_key(), index.last_key()) {
             (Some(first), Some(last)) => {
                 let magic = vec![0x48, 0x6f, 0x70, 0x65];
@@ -51,6 +67,7 @@ impl SSTable {
                     index: index.clone(),
                     first_key: first.to_vec(),
                     last_key: last.to_vec(),
+                    filter,
                     max_size,
                     footer,
                 })
@@ -125,6 +142,7 @@ pub(crate) mod block {
         cur_block_offset: u64,
         cur_block_data: Vec<u8>,
         offsets: Vec<u16>,
+        keys: Vec<Vec<u8>>,
         max_block_size: usize,
     }
 
@@ -142,6 +160,7 @@ pub(crate) mod block {
                 cur_block_offset: 0,
                 cur_block_data: vec![],
                 offsets: vec![],
+                keys: vec![],
                 max_block_size: block_size,
             }
         }
@@ -176,6 +195,7 @@ pub(crate) mod block {
             self.cur_block_data.put(key);
             self.cur_block_data.put_u16_le(value_len as u16);
             self.cur_block_data.put(value);
+            self.keys.push(key.to_vec());
 
             encoded_size
         }
@@ -193,9 +213,14 @@ pub(crate) mod block {
             self.blocks.clone()
         }
 
+        pub(crate) fn keys(&self) -> Vec<Vec<u8>> {
+            self.keys.clone()
+        }
+
         fn clear(&mut self) {
             self.cur_block_data.clear();
             self.offsets.clear();
+            self.keys.clear();
         }
     }
 }

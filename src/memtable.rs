@@ -227,12 +227,9 @@ pub(crate) fn build_sstable(
             index_builder.add_entry(&key, block_offset, key_offset);
         }
     });
-    let blocks: Vec<Block> = block_builder.build();
 
-    let index_start_offset = blocks.iter().map(|b| b.size()).sum::<usize>() as u64;
-    let index = index_builder.build(index_start_offset);
-
-    SSTable::new(&blocks, &index, sst::MAX_TABLE_SIZE).map_err(|_| MemError::FreezeFailure)
+    SSTable::new(&mut block_builder, &mut index_builder, sst::MAX_TABLE_SIZE)
+        .map_err(|_| MemError::FreezeFailure)
 }
 
 #[cfg(test)]
