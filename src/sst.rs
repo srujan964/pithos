@@ -121,6 +121,8 @@ impl WriteableSSTable {
         let mut footer_buf = vec![0; data.footer.size];
         data.footer.encode(&mut footer_buf);
         size += self.file.write(&footer_buf)?;
+        self.file.sync_all()?;
+
         Ok(size)
     }
 }
