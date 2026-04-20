@@ -1,7 +1,9 @@
 use std::{
     fs::{File, OpenOptions},
     io::Write,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::{
@@ -10,7 +12,7 @@ use crate::{
     memtable::Value,
     sst::block::{Block, BlockBuilder, MetaBlock},
 };
-use bytes::{BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 use crossbeam_skiplist::map::Iter;
 
 pub(crate) const U16_SIZE: usize = std::mem::size_of::<u16>();
@@ -21,12 +23,14 @@ pub(crate) const BLOCK_SIZE: usize = 4 * 1024;
 pub(crate) const MAX_TABLE_SIZE: usize = 64 * 1024 * 1024;
 pub(crate) const FOOTER_SIZE: usize = 24;
 
+pub(crate) const SST_FILE_PREFIX: &str = "sst";
+
 ///
 /// The on-disk format of an SSTable is as follows:
 ///
-/// +----------------+----------------+-------+----------------+---------------+----------+
-/// |  Data block 1  |  Data block 2  |  ...  |  Data block N  |  Index Block  |  Footer  |
-/// +----------------+----------------+-------+----------------+---------------+----------+
+/// +----------------+----------------+-------+----------------+--------+--------+----------+
+/// |  Data block 1  |  Data block 2  |  ...  |  Data block N  |  Index |  Meta  |  Footer  |
+/// +----------------+----------------+-------+----------------+--------+--------+----------+
 ///
 #[derive(Clone, Debug)]
 pub(crate) struct SSTableData {
@@ -43,6 +47,7 @@ pub(crate) struct SSTable {
     filter: Bloom,
     first_key: Vec<u8>,
     last_key: Vec<u8>,
+    file: Arc<File>,
     path: PathBuf,
     size: usize,
 }
@@ -63,6 +68,14 @@ pub(crate) struct TableFooter {
 }
 
 impl TableFooter {
+    fn update_index_offset(&mut self, new: u64) {
+        self.index_offset = new;
+    }
+
+    fn update_meta_offset(&mut self, new: u64) {
+        self.meta_offset = new;
+    }
+
     fn encode(&self, mut buf: &mut [u8]) -> bool {
         let id = self.sst_id as u32;
         buf.put_u32_le(id);
@@ -71,14 +84,36 @@ impl TableFooter {
         buf.put_slice(&self.magic);
         true
     }
+
+    fn decode(mut buf: &[u8]) -> Self {
+        let id = buf.get_u32_le();
+        let index_offset = buf.get_u64_le();
+        let meta_offset = buf.get_u64_le();
+        let magic_len = U32_SIZE;
+        let magic = buf[..magic_len].to_vec();
+
+        Self {
+            sst_id: id as usize,
+            index_offset,
+            meta_offset,
+            magic,
+            size: FOOTER_SIZE,
+        }
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum SSTableError {
     #[error("Failed to initialize SSTable")]
     InitFailed,
-    #[error("Unable to flush memtable to sst")]
+    #[error("Unable to flush memtable to SSTable")]
     WriteFailed(#[from] std::io::Error),
+    #[error("Unable to recover SSTable from file")]
+    FailedToOpen,
 }
 
 struct WriteableSSTable {
@@ -100,23 +135,31 @@ impl WriteableSSTable {
         }
     }
 
-    pub(crate) fn write(&mut self, data: &SSTableData) -> Result<usize, std::io::Error> {
+    pub(crate) fn write(&mut self, data: &mut SSTableData) -> Result<usize, std::io::Error> {
         assert_eq!(data.footer.size, FOOTER_SIZE);
 
         let mut size = 0;
         for data_block in data.blocks.iter() {
-            let _ = self.file.write(&data_block.data)?;
+            size += self.file.write(&data_block.data)?;
+            let mut offset_buf: Vec<u8> = vec![];
+            for offset in data_block.offsets.iter() {
+                offset_buf.put_u16_le(*offset);
+            }
+
+            size += self.file.write(&offset_buf)?;
         }
 
-        let meta_size = data.meta.size();
-        let mut meta_buf = vec![0; meta_size];
-        data.meta.encode(&mut meta_buf);
-        size += self.file.write(&meta_buf)?;
-
+        data.footer.update_index_offset(size as u64);
         let index_size = data.index.size();
         let mut index_buf = vec![0; index_size];
         data.index.encode(&mut index_buf);
         size += self.file.write(&index_buf)?;
+
+        data.footer.update_meta_offset(size as u64);
+        let meta_size = data.meta.size();
+        let mut meta_buf = vec![0; meta_size];
+        data.meta.encode(&mut meta_buf);
+        size += self.file.write(&meta_buf)?;
 
         let mut footer_buf = vec![0; data.footer.size];
         data.footer.encode(&mut footer_buf);
@@ -137,30 +180,29 @@ impl SSTableData {
         let blocks: Vec<Block> = block_builder.build();
         let index_start_offset = blocks.iter().map(|b| b.size()).sum::<usize>() as u64;
         let index = index_builder.build(index_start_offset);
-
-        let meta_offset = index_start_offset + index.size() as u64;
         let filter = Bloom::build(block_builder.key_hashes());
-        let footer_size = U32_SIZE * 2 + U64_SIZE * 2;
 
         let data = match (index.first_key(), index.last_key()) {
             (Some(first), Some(last)) => {
-                let magic = vec![0x48, 0x6f, 0x70, 0x65];
-                let footer = TableFooter {
-                    sst_id: id,
-                    index_offset: index_start_offset,
-                    meta_offset,
-                    magic: magic.clone(),
-                    size: footer_size,
-                };
-
                 let meta = MetaBlock {
                     filter: filter.clone(),
                     first_key: first.to_vec(),
                     last_key: last.to_vec(),
+                    num_blks: blocks.len() as u16,
+                    count_per_blk: blocks.iter().map(|blk| blk.num_entries).collect(),
+                };
+
+                let magic = vec![0x48, 0x6f, 0x70, 0x65];
+                let footer = TableFooter {
+                    sst_id: id,
+                    index_offset: 0,
+                    meta_offset: 0,
+                    magic: magic.clone(),
+                    size: U32_SIZE * 2 + U64_SIZE * 2,
                 };
 
                 Ok(Self {
-                    blocks: blocks.to_vec(),
+                    blocks,
                     index: index.clone(),
                     meta,
                     footer,
@@ -169,20 +211,63 @@ impl SSTableData {
             (_, _) => Err(SSTableError::InitFailed),
         };
 
-        let data = data?;
-        let path = Path::new(&data_dir).join(format!("sst-{id}"));
+        let mut data = data?;
+        let path = Path::new(&data_dir).join(format!("{}-{}", SST_FILE_PREFIX, id));
         let mut writer = WriteableSSTable::create(&path)?;
 
-        let bytes_written = writer.write(&data)?;
+        let bytes_written = writer.write(&mut data)?;
+        let read_only_file = OpenOptions::new().read(true).open(&path)?;
+
         Ok(SSTable {
             id,
             index,
             filter,
             first_key: data.meta.first_key,
             last_key: data.meta.last_key,
+            file: Arc::new(read_only_file),
             path,
             size: bytes_written,
         })
+    }
+}
+
+impl SSTable {
+    pub(crate) fn open(id: usize, path: &Path, file: Arc<File>) -> Result<Self, SSTableError> {
+        let size: u64 = match file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(_e) => {
+                return Err(SSTableError::FailedToOpen);
+            }
+        };
+
+        let footer_offset = size - FOOTER_SIZE as u64;
+        let raw_footer_data = Self::read_at(&file, FOOTER_SIZE, footer_offset)?;
+        let footer = TableFooter::decode(&raw_footer_data);
+
+        let meta_size = footer_offset - footer.meta_offset;
+        let raw_meta_data = Self::read_at(&file, meta_size as usize, footer.meta_offset)?;
+        let meta = MetaBlock::decode(&raw_meta_data);
+
+        let index_size = footer.meta_offset - footer.index_offset;
+        let raw_index_data = Self::read_at(&file, index_size as usize, footer.index_offset)?;
+        let index = Index::decode(&raw_index_data, index_size as usize, footer.index_offset);
+
+        Ok(Self {
+            id,
+            index,
+            filter: meta.filter,
+            first_key: meta.first_key,
+            last_key: meta.last_key,
+            file,
+            path: path.to_path_buf(),
+            size: size as usize,
+        })
+    }
+
+    fn read_at(file: &File, len: usize, offset: u64) -> Result<Vec<u8>, std::io::Error> {
+        let mut buf = vec![0; len];
+        file.read_exact_at(&mut buf, offset)?;
+        Ok(buf)
     }
 }
 
@@ -230,11 +315,21 @@ pub(crate) mod block {
         pub(crate) id: usize,
         pub(crate) data: Vec<u8>,
         pub(crate) offsets: Vec<u16>,
+        pub(crate) num_entries: u16,
     }
 
     impl Block {
         pub(crate) fn size(&self) -> usize {
             self.data.len()
+        }
+
+        pub(crate) fn first_key(&self) -> Vec<u8> {
+            let mut buf = &self.data[..];
+            let key_len = buf.get_u16_le() as usize;
+            let key = buf[..key_len].to_vec();
+            buf.advance(key_len);
+
+            key
         }
 
         pub(crate) fn decode_pair(&self, offset: &u16) -> Result<Pair, DecodingError> {
@@ -281,10 +376,12 @@ pub(crate) mod block {
         pub(super) filter: Bloom,
         pub(super) first_key: Vec<u8>,
         pub(super) last_key: Vec<u8>,
+        pub(super) num_blks: u16,
+        pub(super) count_per_blk: Vec<u16>,
     }
 
     impl MetaBlock {
-        pub(super) fn encode(&self, buf: &mut Vec<u8>) -> bool {
+        pub(super) fn encode(&self, mut buf: &mut [u8]) -> bool {
             self.filter.encode(buf);
 
             let key_len = self.first_key.len() as u16;
@@ -294,11 +391,54 @@ pub(crate) mod block {
             let key_len = self.last_key.len() as u16;
             buf.put_u16_le(key_len);
             buf.put(self.last_key.as_ref());
+
+            buf.put_u16_le(self.num_blks);
+
+            let len = self.count_per_blk.len() as u16;
+            buf.put_u16_le(len);
+            for count in self.count_per_blk.iter() {
+                buf.put_u16_le(*count);
+            }
             true
         }
 
+        pub(super) fn decode(mut buf: &[u8]) -> Self {
+            let filter = Bloom::decode(buf);
+
+            let key_len = buf.get_u16_le() as usize;
+            let first_key = buf[..key_len].to_vec();
+            buf.advance(key_len);
+
+            let key_len = buf.get_u16_le() as usize;
+            let last_key = buf[..key_len].to_vec();
+            buf.advance(key_len);
+
+            let num_blocks = buf.get_u16_le();
+
+            let len = buf.get_u16_le();
+            let mut count_per_block: Vec<u16> = Vec::with_capacity(len as usize);
+            for _ in 0..len {
+                count_per_block.push(buf.get_u16_le());
+            }
+
+            Self {
+                filter,
+                first_key,
+                last_key,
+                num_blks: num_blocks,
+                count_per_blk: count_per_block,
+            }
+        }
+
         pub(super) fn size(&self) -> usize {
-            self.filter.size() + self.first_key.len() + self.last_key.len() + U16_SIZE * 2
+            let sizes = [
+                self.filter.size(),
+                (self.first_key.len() + U16_SIZE),
+                (self.last_key.len() + U16_SIZE),
+                U16_SIZE,
+                ((self.count_per_blk.len() * U16_SIZE) + U16_SIZE),
+            ];
+            sizes.iter().sum()
         }
     }
 
@@ -350,6 +490,7 @@ pub(crate) mod block {
                     id: self.num,
                     data: self.cur_block_data.clone(),
                     offsets: self.offsets.clone(),
+                    num_entries: self.offsets.len() as u16,
                 };
                 self.cur_block_offset += block.size() as u64;
                 self.blocks.push(block);
@@ -374,6 +515,7 @@ pub(crate) mod block {
                     id: self.num,
                     data: self.cur_block_data.clone(),
                     offsets: self.offsets.clone(),
+                    num_entries: self.offsets.len() as u16,
                 };
                 self.blocks.push(block);
             }
@@ -395,11 +537,12 @@ pub(crate) mod block {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fs::OpenOptions, path::PathBuf, sync::Arc};
 
     use crate::{
         memtable::{Buffer, Memtable},
         sst::{
+            SST_FILE_PREFIX, SSTable,
             block::{BlockBuilder, DecodingError},
             build_sstable,
         },
@@ -438,6 +581,8 @@ mod tests {
         assert!(!block.data.is_empty());
         assert_eq!(block.data, expected_data);
         assert_eq!(block.offsets, expected_offsets);
+
+        assert_eq!(block.first_key(), "key_1".as_bytes());
     }
 
     #[test]
@@ -547,6 +692,15 @@ mod tests {
         let sst = result.unwrap();
 
         assert!(sst.size > 0);
+
+        let expected_path = path.join(format!("{}-{}", SST_FILE_PREFIX, table.id.clone()));
+        let file = OpenOptions::new().read(true).open(&expected_path);
+
+        assert!(file.is_ok());
+        let file = file.unwrap();
+
+        let sst = SSTable::open(table.id, &expected_path, Arc::new(file));
+        assert!(sst.is_ok());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 
 use crate::sst;
 
@@ -82,6 +82,29 @@ impl Index {
             buf.put_u16_le(entry.key_offset)
         }
         true
+    }
+
+    pub(crate) fn decode(mut buf: &[u8], size: usize, start: u64) -> Self {
+        let mut entries = vec![];
+        while !buf.is_empty() {
+            let key_len = buf.get_u16_le() as usize;
+            let key: Vec<u8> = buf[..key_len].to_vec();
+            buf.advance(key_len);
+            let block_offset = buf.get_u64_le();
+            let key_offset = buf.get_u16_le();
+
+            entries.push(IndexEntry {
+                key,
+                block_offset,
+                key_offset,
+            });
+        }
+
+        Self {
+            start,
+            blocks: entries,
+            size,
+        }
     }
 
     pub(crate) fn first_key(&self) -> Option<&[u8]> {
@@ -179,7 +202,7 @@ mod tests {
 
         let mut buf: &[u8] = &buf;
 
-        for i in 0..blocks.len() {
+        for block in &blocks {
             let key_len = buf.get_u16_le() as usize;
             let key = buf[..key_len].to_vec();
             buf.advance(key_len as usize);
@@ -187,9 +210,9 @@ mod tests {
             let block_offset = buf.get_u64_le();
             let key_offset = buf.get_u16_le();
 
-            assert_eq!(key, blocks[i].key);
-            assert_eq!(block_offset, blocks[i].block_offset);
-            assert_eq!(key_offset, blocks[i].key_offset);
+            assert_eq!(key, block.key);
+            assert_eq!(block_offset, block.block_offset);
+            assert_eq!(key_offset, block.key_offset);
         }
     }
 }

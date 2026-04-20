@@ -47,7 +47,7 @@ pub(crate) enum Value {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Memtable {
-    id: usize,
+    pub(crate) id: usize,
     max_size: usize,
     size: Arc<AtomicUsize>,
     pub(crate) store: Arc<SkipMap<Bytes, Value>>,
@@ -221,7 +221,6 @@ mod tests {
     use temp_dir::TempDir;
 
     fn test_memtable(path: PathBuf) -> Memtable {
-        let tempdir = TempDir::new();
         let options = TableOptions {
             data_dir: path,
             max_size: 256,

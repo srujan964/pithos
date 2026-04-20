@@ -55,17 +55,14 @@ impl Filter for Bloom {
         }
     }
 
-    fn decode(buf: &[u8]) -> Self {
-        let mut buf = buf;
+    fn decode(mut buf: &[u8]) -> Self {
         let len = buf.get_u16_le() as usize;
-        let filter = &buf[..len];
+        let filter = buf[..len].to_vec();
         buf.advance(len);
-
-        let bits = &filter[..len - 1];
-        let k = filter[len - 1];
+        let k = buf.get_u8();
 
         Self {
-            filter: Bytes::copy_from_slice(bits),
+            filter: Bytes::copy_from_slice(filter.as_slice()),
             k,
         }
     }
@@ -76,10 +73,11 @@ impl Filter for Bloom {
     // |  len (16 bits)  |  filter bytes  |  k (8 bits)  |
     // +-------------------------------------------------+
     //
-    fn encode(&self, buf: &mut Vec<u8>) {
-        let filter_len: u16 = (self.filter.len() + 1) as u16;
+    fn encode(&self, mut buf: &mut [u8]) {
+        let filter_len: u16 = self.filter.len() as u16;
+        eprintln!("Filter length: {}", filter_len);
         buf.put_u16_le(filter_len);
-        buf.extend(&self.filter);
+        buf.put(self.filter.as_ref());
         buf.put_u8(self.k);
     }
 }
@@ -123,7 +121,7 @@ impl Bloom {
     }
 
     pub(crate) fn size(&self) -> usize {
-        self.filter.len() + U16_SIZE + 8
+        self.filter.len() + U16_SIZE + 1
     }
 }
 
@@ -210,11 +208,10 @@ mod tests {
         let hashes: Vec<u64> = keys.iter().map(|k| seahash::hash(k.as_bytes())).collect();
         let filter = Bloom::build(&hashes);
 
-        let mut buf: Vec<u8> = vec![];
+        let mut buf: Vec<u8> = vec![0; filter.size()];
         filter.encode(&mut buf);
 
         let result = Bloom::decode(&buf);
-
         assert_eq!(result, filter);
     }
 }
