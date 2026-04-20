@@ -1,6 +1,6 @@
 use crate::iterator::merge_iterator::MergeIterator;
 use crate::memtable::{self, Buffer, MemtableIterator, TableOptions, Value};
-use crate::sst::SSTable;
+use crate::sst::{SSTable, SSTableData};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -243,10 +243,7 @@ mod tests {
     use std::ops::Bound;
 
     use super::*;
-    use crate::{
-        memtable::{MemError, Memtable},
-        sst::SSTable,
-    };
+    use crate::memtable::{MemError, Memtable};
     use bytes::Bytes;
     use temp_dir::TempDir;
 
@@ -301,9 +298,7 @@ mod tests {
         }
     }
 
-    fn init_storage<B: Buffer + Clone>(size: usize) -> CoreStorage<B> {
-        let tempdir = TempDir::new().unwrap();
-        let path = tempdir.path();
+    fn init_storage<B: Buffer + Clone>(size: usize, path: PathBuf) -> CoreStorage<B> {
         let options = CoreOptions {
             max_memtable_size: size,
             data_dir: path.to_path_buf(),
@@ -314,7 +309,9 @@ mod tests {
 
     #[test]
     fn storage_stores_key_value_pair_in_memtable() {
-        let storage = init_storage::<TestMemtable>(memtable::MAX_TABLE_SIZE);
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path();
+        let storage = init_storage::<TestMemtable>(memtable::MAX_TABLE_SIZE, path.to_path_buf());
 
         let result = storage.put(TEST_KEY.into(), TEST_VALUE.into());
         assert!(result.is_ok());
@@ -322,7 +319,9 @@ mod tests {
 
     #[test]
     fn storage_retrieves_value_from_memtable() {
-        let storage = init_storage::<TestMemtable>(memtable::MAX_TABLE_SIZE);
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path();
+        let storage = init_storage::<TestMemtable>(memtable::MAX_TABLE_SIZE, path.to_path_buf());
 
         let result = storage.get(TEST_KEY.into());
         assert!(result.is_ok());
@@ -332,7 +331,9 @@ mod tests {
 
     #[test]
     fn storage_deletes_value_from_memtable() {
-        let storage = init_storage::<TestMemtable>(memtable::MAX_TABLE_SIZE);
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path();
+        let storage = init_storage::<TestMemtable>(memtable::MAX_TABLE_SIZE, path.to_path_buf());
 
         let result = storage.delete(TEST_KEY.into());
         assert!(result.is_ok());
@@ -377,26 +378,29 @@ mod tests {
             }
         }
 
-        let storage = init_storage::<SmallMemtable>(3);
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path();
+        let storage = init_storage::<SmallMemtable>(3, path.to_path_buf());
 
         let result = storage.put(TEST_KEY.into(), TEST_VALUE.into());
         assert!(result.is_ok());
     }
 
-    fn test_memtable() -> Memtable {
-        let tempdir = TempDir::new();
+    fn test_memtable(id: usize, path: PathBuf) -> Memtable {
         let options = TableOptions {
-            data_dir: tempdir.unwrap().path().to_path_buf(),
+            data_dir: path,
             max_size: 256,
         };
-        Memtable::create(1, Some(options))
+        Memtable::create(id, Some(options))
     }
 
     #[test]
     fn force_flush_memtable_empties_frozen_list_and_updates_level_zero() {
-        let memtable = test_memtable();
-        let frozen_table_one = test_memtable();
-        let frozen_table_two = test_memtable();
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path();
+        let memtable = test_memtable(3, path.to_path_buf());
+        let frozen_table_one = test_memtable(2, path.to_path_buf());
+        let frozen_table_two = test_memtable(1, path.to_path_buf());
 
         let key = Bytes::from("Key");
         let value = Bytes::from("Value");
@@ -444,9 +448,11 @@ mod tests {
 
     #[test]
     fn scan_creates_an_iterator_over_memtables() {
-        let memtable = test_memtable();
-        let intermediate_table = test_memtable();
-        let oldest_table = test_memtable();
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path();
+        let memtable = test_memtable(3, path.to_path_buf());
+        let intermediate_table = test_memtable(2, path.to_path_buf());
+        let oldest_table = test_memtable(1, path.to_path_buf());
 
         let key = Bytes::from("key_1");
         let key_2 = Bytes::from("key_2");

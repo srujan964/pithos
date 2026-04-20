@@ -1,11 +1,9 @@
-use crate::index::IndexBuilder;
 use crate::iterator::StorageIter;
-use crate::sst::block::{Block, BlockBuilder};
 use crate::sst::{self, SSTable};
 
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
-use crossbeam_skiplist::map::{Iter, Range};
+use crossbeam_skiplist::map::Range;
 use ouroboros::self_referencing;
 
 use std::ops::Bound;
@@ -52,7 +50,8 @@ pub(crate) struct Memtable {
     id: usize,
     max_size: usize,
     size: Arc<AtomicUsize>,
-    store: Arc<SkipMap<Bytes, Value>>,
+    pub(crate) store: Arc<SkipMap<Bytes, Value>>,
+    options: TableOptions,
     wal_dir: PathBuf,
 }
 
@@ -98,7 +97,7 @@ impl Buffer for Memtable {
     fn create(id: usize, options: Option<TableOptions>) -> Self {
         let options = options.unwrap_or_default();
 
-        let mut wal_dir = options.data_dir;
+        let mut wal_dir = options.data_dir.clone();
         wal_dir.push(WAL_DIR);
         wal_dir.push(format!("{}", id));
 
@@ -112,6 +111,7 @@ impl Buffer for Memtable {
             max_size: options.max_size,
             store: Arc::new(SkipMap::new()),
             size: Arc::new(0.into()),
+            options: options.clone(),
             wal_dir,
         }
     }
@@ -148,7 +148,13 @@ impl Buffer for Memtable {
     }
 
     fn flush(&self) -> Result<SSTable, MemError> {
-        build_sstable(self.store.iter(), sst::BLOCK_SIZE)
+        sst::build_sstable(
+            self.id,
+            self.store.iter(),
+            sst::BLOCK_SIZE,
+            self.options.data_dir.clone(),
+        )
+        .map_err(|_| MemError::FreezeFailure)
     }
 }
 
@@ -208,40 +214,16 @@ impl Iterator for MemtableIterator {
     }
 }
 
-pub(crate) fn build_sstable(
-    memtable_iter: Iter<'_, Bytes, Value>,
-    block_size: usize,
-) -> Result<SSTable, MemError> {
-    let mut block_builder = BlockBuilder::init(1, block_size);
-    let mut index_builder = IndexBuilder::builder();
-    memtable_iter.for_each(|entry| {
-        let key = entry.key().to_vec();
-        let value = match entry.value() {
-            Value::Plain(v) => v.to_vec(),
-            Value::Tombstone => vec![],
-        };
-
-        block_builder.encode_pair(&key, &value);
-        let block_offset = block_builder.latest_block_offset();
-        if let Some(key_offset) = block_builder.latest_key_offset() {
-            index_builder.add_entry(&key, block_offset, key_offset);
-        }
-    });
-
-    SSTable::new(&mut block_builder, &mut index_builder, sst::MAX_TABLE_SIZE)
-        .map_err(|_| MemError::FreezeFailure)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use temp_dir::TempDir;
 
-    fn test_memtable() -> Memtable {
+    fn test_memtable(path: PathBuf) -> Memtable {
         let tempdir = TempDir::new();
         let options = TableOptions {
-            data_dir: tempdir.unwrap().path().to_path_buf(),
+            data_dir: path,
             max_size: 256,
         };
         Memtable::create(1, Some(options))
@@ -249,7 +231,9 @@ mod tests {
 
     #[test]
     fn memtable_stores_and_retrieves_key_value_pairs() {
-        let table = test_memtable();
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path();
+        let table = test_memtable(path.to_path_buf());
         let key = Bytes::from("1");
         let value = Bytes::from("123");
 
@@ -263,7 +247,9 @@ mod tests {
 
     #[test]
     fn memtable_stores_tombstone_marker_for_key_being_deleted() {
-        let table = test_memtable();
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path();
+        let table = test_memtable(path.to_path_buf());
         let key = Bytes::from("1");
         let value = Bytes::from("123");
 
@@ -279,7 +265,9 @@ mod tests {
 
     #[test]
     fn memtable_returns_empty_if_queried_key_does_not_exist() {
-        let table = test_memtable();
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path();
+        let table = test_memtable(path.to_path_buf());
         let key = Bytes::from("1");
 
         let result = table.get(&key);
@@ -303,66 +291,6 @@ mod tests {
         let result = std::fs::exists(expected_wal_dir);
         assert!(result.is_ok());
         assert!(result.unwrap());
-    }
-
-    #[test]
-    fn build_sstable_from_memtable_contents() {
-        let table = test_memtable();
-        let k1 = Bytes::from("1");
-        let v1 = Bytes::from("123");
-
-        let k2 = Bytes::from("2");
-        let v2 = Bytes::from("456");
-
-        let k3 = Bytes::from("3");
-        let v3 = Bytes::from("789");
-
-        let k4 = Bytes::from("4");
-        let v4 = Bytes::from("0000");
-
-        let _ = table.put(&k1, &v1);
-        let _ = table.put(&k2, &v2);
-        let _ = table.put(&k3, &v3);
-        let _ = table.put(&k4, &v4);
-
-        let result = build_sstable(table.store.iter(), 32);
-        assert!(result.is_ok());
-
-        let table: SSTable = result.unwrap();
-
-        assert_eq!(table.first_key, k1.to_vec());
-        assert_eq!(table.last_key, k4.to_vec());
-        assert_eq!(table.blocks.len(), 2);
-
-        let k1_idx = table.index.find_block_by_key(&k1).unwrap();
-        assert_eq!(k1_idx.offsets(), (0, 0));
-
-        let k4_idx = table.index.find_block_by_key(&k4).unwrap();
-        let first_block = table.blocks[0].clone();
-        assert_eq!(k4_idx.offsets(), (first_block.size() as u64, 0));
-    }
-
-    #[test]
-    fn memtable_freeze_creates_sst() {
-        let table = test_memtable();
-        let k1 = Bytes::from("1");
-        let v1 = Bytes::from("123");
-
-        let k2 = Bytes::from("2");
-        let v2 = Bytes::from("456");
-
-        let k3 = Bytes::from("3");
-        let v3 = Bytes::from("789");
-
-        let _ = table.put(&k1, &v1);
-        let _ = table.put(&k2, &v2);
-        let _ = table.put(&k3, &v3);
-
-        let result = table.flush();
-        assert!(result.is_ok());
-
-        let sst = result.unwrap();
-        assert_eq!(sst.blocks.len(), 1);
     }
 
     #[test]

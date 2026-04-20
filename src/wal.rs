@@ -154,7 +154,7 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let path = tempdir.path();
 
-        let wal_writer = WalWriter::open(&PathBuf::from(path));
+        let wal_writer = WalWriter::open(&path.to_path_buf());
         assert!(wal_writer.is_ok());
 
         let expected_path = PathBuf::from(path).join("wal-00001.log");
@@ -172,7 +172,7 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let path = tempdir.path();
 
-        let writer = WalWriter::open(&PathBuf::from(path))?;
+        let writer = WalWriter::open(&path.to_path_buf())?;
         let wal_path = PathBuf::from(path).join("wal-00001.log");
 
         let key = Bytes::from("100");

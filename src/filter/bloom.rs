@@ -1,6 +1,9 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::filter::{BitSet, BitSetMut, Filter};
+use crate::{
+    filter::{BitSet, BitSetMut, Filter},
+    sst::U16_SIZE,
+};
 
 /// Ideally, we only suffer an unnecessary disk-access 1 in every 100 keys.
 const FALSE_POS_RATE: f64 = 0.01;
@@ -26,9 +29,9 @@ impl Filter for Bloom {
     fn build(hashes: &[u64]) -> Self {
         let Params {
             m,
-            n,
+            n: _,
             k,
-            bits_per_key,
+            bits_per_key: _,
         } = Bloom::estimate_parameters(hashes.len(), FALSE_POS_RATE);
         let k = k.clamp(1, 30);
 
@@ -117,6 +120,10 @@ impl Bloom {
         let mut h2 = hash >> 32;
         h2 |= 1;
         h1.wrapping_add(h2.wrapping_mul(i as u64)) % m
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.filter.len() + U16_SIZE + 8
     }
 }
 
