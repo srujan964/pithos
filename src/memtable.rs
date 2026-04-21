@@ -80,6 +80,8 @@ fn create_wal_dir(path: &Path) -> Result<(), MemError> {
 pub(crate) trait Buffer {
     fn create(id: usize, options: Option<TableOptions>) -> Self;
 
+    fn id(&self) -> usize;
+
     fn size(&self) -> usize;
 
     fn put(&self, key: &Bytes, value: &Bytes) -> Result<usize, MemError>;
@@ -114,6 +116,10 @@ impl Buffer for Memtable {
             options: options.clone(),
             wal_dir,
         }
+    }
+
+    fn id(&self) -> usize {
+        self.id
     }
 
     fn size(&self) -> usize {

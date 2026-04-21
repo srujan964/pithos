@@ -193,10 +193,12 @@ impl<B: Buffer + Clone> CoreStorage<B> {
         let _ = self.try_freeze();
 
         let state_lock = self.freeze_lock.lock().unwrap();
-        let state = self.state.load_full();
+        let mut state = self.state.load_full();
         while !state.frozen.is_empty() {
             match self.flush_oldest_memtable(&state_lock) {
-                Ok(_) => {}
+                Ok(_) => {
+                    state = self.state.load_full();
+                }
                 Err(_) => {
                     eprintln!("Error while flushing oldest memtable. It was possibly empty.");
                     break;
@@ -258,6 +260,10 @@ mod tests {
     impl Buffer for TestMemtable {
         fn create(_id: usize, _options: Option<TableOptions>) -> Self {
             TestMemtable { size: 0 }
+        }
+
+        fn id(&self) -> usize {
+            1
         }
 
         fn size(&self) -> usize {
@@ -349,6 +355,10 @@ mod tests {
                 SmallMemtable {}
             }
 
+            fn id(&self) -> usize {
+                1
+            }
+
             fn size(&self) -> usize {
                 8
             }
@@ -399,8 +409,8 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let path = tempdir.path();
         let memtable = test_memtable(3, path.to_path_buf());
-        let frozen_table_one = test_memtable(2, path.to_path_buf());
-        let frozen_table_two = test_memtable(1, path.to_path_buf());
+        let frozen_table_one = test_memtable(1, path.to_path_buf());
+        let frozen_table_two = test_memtable(2, path.to_path_buf());
 
         let key = Bytes::from("Key");
         let value = Bytes::from("Value");

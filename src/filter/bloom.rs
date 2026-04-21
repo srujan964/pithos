@@ -75,7 +75,6 @@ impl Filter for Bloom {
     //
     fn encode(&self, mut buf: &mut [u8]) {
         let filter_len: u16 = self.filter.len() as u16;
-        eprintln!("Filter length: {}", filter_len);
         buf.put_u16_le(filter_len);
         buf.put(self.filter.as_ref());
         buf.put_u8(self.k);
