@@ -306,7 +306,6 @@ pub(crate) mod block {
     use super::U16_SIZE;
     use crate::filter::Filter;
     use crate::filter::bloom::Bloom;
-    use crate::types::Pair;
     use bytes::Buf;
     use std::vec;
 
@@ -332,29 +331,17 @@ pub(crate) mod block {
             key
         }
 
-        pub(crate) fn decode_pair(&self, offset: &u16) -> Result<Pair, DecodingError> {
+        pub(crate) fn decode_pair(&self, offset: &u16) -> Result<(&[u8], &[u8]), DecodingError> {
             let offset = *offset as usize;
             if offset >= self.data.len() {
                 return Err(DecodingError::InaccessibleOffset);
             }
 
-            let (pair, _size) = Self::decode(&self.data, offset);
+            let pair = Self::decode(&self.data, offset);
             Ok(pair)
         }
 
-        pub(crate) fn decode_all(&self) -> Result<Vec<Pair>, DecodingError> {
-            let mut start = 0;
-            let mut pairs = vec![];
-
-            while start < self.data.len() {
-                let (pair, size) = Self::decode(&self.data, start);
-                pairs.push(pair);
-                start += size;
-            }
-            Ok(pairs)
-        }
-
-        fn decode(buf: &[u8], offset: usize) -> (Pair, usize) {
+        fn decode(buf: &[u8], offset: usize) -> (&[u8], &[u8]) {
             let mut buf = &buf[offset..];
 
             let key_len = buf.get_u16_le() as usize;
@@ -365,9 +352,7 @@ pub(crate) mod block {
             let val = &buf[..val_len];
             buf.advance(val_len);
 
-            let size = key.len() + val.len() + 2 * U16_SIZE;
-
-            (Pair::new(key, val), size)
+            (key, val)
         }
     }
 
@@ -603,11 +588,11 @@ mod tests {
         let offset = block.offsets.last().unwrap();
         let second_result = block.decode_pair(offset).unwrap();
 
-        assert_eq!(first_result.key(), k1);
-        assert_eq!(first_result.value(), v1);
+        assert_eq!(first_result.0, k1);
+        assert_eq!(first_result.1, v1);
 
-        assert_eq!(second_result.key(), k2);
-        assert_eq!(second_result.value(), v2);
+        assert_eq!(second_result.0, k2);
+        assert_eq!(second_result.1, v2);
     }
 
     #[test]
@@ -629,31 +614,6 @@ mod tests {
         assert!(actual.is_err());
         let err = actual.unwrap_err();
         assert_eq!(err, DecodingError::InaccessibleOffset);
-    }
-
-    #[test]
-    fn block_decode_all_decodes_entire_block() {
-        let mut builder = BlockBuilder::init(1, 4 * 1024);
-        let k1 = "key_1".as_bytes();
-        let v1 = "value_1".as_bytes();
-        let k2 = "key_2".as_bytes();
-        let v2 = "value_2".as_bytes();
-
-        builder.encode_pair(k1, v1);
-        builder.encode_pair(k2, v2);
-        let blocks = builder.build();
-        let block = blocks.first().unwrap();
-
-        let pairs = block.decode_all().unwrap();
-        let mut pairs_iter = pairs.iter();
-
-        let pair_one = pairs_iter.next().unwrap();
-        assert_eq!(pair_one.key(), k1);
-        assert_eq!(pair_one.value(), v1);
-
-        let pair_two = pairs_iter.next().unwrap();
-        assert_eq!(pair_two.key(), k2);
-        assert_eq!(pair_two.value(), v2);
     }
 
     fn test_memtable(path: PathBuf) -> Memtable {

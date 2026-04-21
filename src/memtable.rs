@@ -1,7 +1,7 @@
 use crate::iterator::StorageIter;
 use crate::sst::{self, SSTable};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use crossbeam_skiplist::SkipMap;
 use crossbeam_skiplist::map::Range;
 use ouroboros::self_referencing;

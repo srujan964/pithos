@@ -1,6 +1,6 @@
 use crate::iterator::merge_iterator::MergeIterator;
-use crate::memtable::{self, Buffer, MemtableIterator, TableOptions, Value};
-use crate::sst::{SSTable, SSTableData};
+use crate::memtable::{self, Buffer, MemtableIterator, TableOptions};
+use crate::sst::SSTable;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -243,7 +243,7 @@ mod tests {
     use std::ops::Bound;
 
     use super::*;
-    use crate::memtable::{MemError, Memtable};
+    use crate::memtable::{MemError, Memtable, Value};
     use bytes::Bytes;
     use temp_dir::TempDir;
 

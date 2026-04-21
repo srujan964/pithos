@@ -1,3 +1,4 @@
+pub(crate) mod block;
 pub(crate) mod merge_iterator;
 
 /// A small trait to manage iterator of storage buffers that yields ```(bytes::Bytes, memtable::Value)```.
