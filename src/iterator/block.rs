@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::{iterator::StorageIter, memtable::Value, sst::block::Block};
+use crate::{iterator::StorageIter, sst::block::Block, types::Pair, types::Value};
 
 pub(crate) struct BlockIterator {
     block: Arc<Block>,
@@ -34,7 +34,7 @@ impl BlockIterator {
 }
 
 impl StorageIter for BlockIterator {
-    type KeyVal = (Bytes, Value);
+    type KeyVal = Pair;
 
     fn next(&mut self) -> Option<Self::KeyVal> {
         Iterator::next(self)
@@ -42,11 +42,10 @@ impl StorageIter for BlockIterator {
 }
 
 impl Iterator for BlockIterator {
-    type Item = (Bytes, Value);
+    type Item = Pair;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.idx + 1 >= self.block.offsets.len() {
-            eprintln!("here for some reason");
             return None;
         }
 
@@ -54,7 +53,7 @@ impl Iterator for BlockIterator {
 
         let pair = self
             .block
-            .decode_pair(&offset)
+            .decode_at(&offset)
             .map(|(k, v)| {
                 if v.is_empty() {
                     (Bytes::copy_from_slice(k), Value::Tombstone)
@@ -82,8 +81,9 @@ mod tests {
 
     use crate::{
         iterator::block::BlockIterator,
-        memtable::Value,
         sst::block::{Block, BlockBuilder},
+        types::Pair,
+        types::Value,
     };
 
     fn build_block() -> Vec<Block> {
@@ -114,7 +114,7 @@ mod tests {
 
         let mut iter = BlockIterator::new(Arc::new(block)).unwrap();
 
-        let item: Option<(Bytes, Value)> = iter.next();
+        let item: Option<Pair> = iter.next();
         let pair = item.unwrap();
 
         assert_eq!(pair.0, Bytes::from("key_1"));

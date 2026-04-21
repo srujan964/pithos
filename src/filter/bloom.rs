@@ -73,7 +73,7 @@ impl Filter for Bloom {
     // |  len (16 bits)  |  filter bytes  |  k (8 bits)  |
     // +-------------------------------------------------+
     //
-    fn encode(&self, mut buf: &mut [u8]) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         let filter_len: u16 = self.filter.len() as u16;
         buf.put_u16_le(filter_len);
         buf.put(self.filter.as_ref());
@@ -207,7 +207,7 @@ mod tests {
         let hashes: Vec<u64> = keys.iter().map(|k| seahash::hash(k.as_bytes())).collect();
         let filter = Bloom::build(&hashes);
 
-        let mut buf: Vec<u8> = vec![0; filter.size()];
+        let mut buf: Vec<u8> = Vec::with_capacity(filter.size());
         filter.encode(&mut buf);
 
         let result = Bloom::decode(&buf);

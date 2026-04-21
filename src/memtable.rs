@@ -1,7 +1,8 @@
 use crate::iterator::StorageIter;
 use crate::sst::{self, SSTable};
+use crate::types::Value;
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use crossbeam_skiplist::map::Range;
 use ouroboros::self_referencing;
@@ -37,12 +38,6 @@ impl Default for TableOptions {
             data_dir: PathBuf::from(crate::core::DATA_DIR),
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Value {
-    Plain(Bytes),
-    Tombstone,
 }
 
 #[derive(Debug, Clone)]

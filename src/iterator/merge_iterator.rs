@@ -1,5 +1,5 @@
 use crate::iterator::StorageIter;
-use crate::memtable::Value;
+use crate::types::Value;
 
 use bytes::Bytes;
 use std::cmp::Ordering;
@@ -112,7 +112,8 @@ impl<I: StorageIter<KeyVal = (Bytes, Value)>> Iterator for MergeIterator<I> {
 mod tests {
 
     use crate::iterator::merge_iterator::{HeapItem, MergeIterator};
-    use crate::memtable::{MemtableIterator, Value};
+    use crate::memtable::MemtableIterator;
+    use crate::types::Value;
     use bytes::Bytes;
     use crossbeam_skiplist::SkipMap;
     use std::collections::{BinaryHeap, VecDeque};

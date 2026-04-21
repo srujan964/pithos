@@ -34,6 +34,14 @@ impl IndexEntry {
     pub(crate) fn size(&self) -> usize {
         sst::U16_SIZE + self.key.len() + sst::U64_SIZE + sst::U16_SIZE
     }
+
+    pub(crate) fn block_offset(&self) -> u64 {
+        self.block_offset
+    }
+
+    pub(crate) fn key_offset(&self) -> u16 {
+        self.key_offset
+    }
 }
 
 impl IndexBuilder {
@@ -66,18 +74,30 @@ impl Index {
             .ok()
     }
 
-    pub(crate) fn find_block_by_key(&self, key: &[u8]) -> Option<&IndexEntry> {
-        self.blocks
+    pub(crate) fn find_idx_entry_by_key(&self, key: &[u8]) -> Option<(&IndexEntry, u64)> {
+        let entry_idx = match self
+            .blocks
             .binary_search_by_key(&key.to_vec(), |entry| entry.key.clone())
-            .map(|idx: usize| &self.blocks[idx])
-            .ok()
+        {
+            Ok(idx) => idx,
+            Err(_) => return None,
+        };
+
+        let entry = &self.blocks[entry_idx];
+        let block_size = self.blocks[entry_idx..]
+            .iter()
+            .find(|other| other.block_offset > entry.block_offset)
+            .map(|other| other.block_offset - entry.block_offset)
+            .unwrap_or_else(|| self.start - entry.block_offset);
+
+        Some((&entry, block_size))
     }
 
-    pub(crate) fn encode(&self, mut buf: &mut [u8]) -> bool {
+    pub(crate) fn encode(&self, buf: &mut Vec<u8>) -> bool {
         for entry in self.blocks.iter() {
             let key_len = entry.key.len() as u16;
             buf.put_u16_le(key_len);
-            buf.put(entry.key.as_ref());
+            buf.put_slice(entry.key.as_ref());
             buf.put_u64_le(entry.block_offset);
             buf.put_u16_le(entry.key_offset)
         }
@@ -158,8 +178,8 @@ mod tests {
                 let key = "000".to_string();
                 IndexEntry {
                     key: key.into(),
-                    block_offset: i * 1000_u64,
-                    key_offset: 100u16,
+                    block_offset: 4000_u64,
+                    key_offset: i * 100u16,
                 }
             })
             .collect();
@@ -175,14 +195,42 @@ mod tests {
     }
 
     #[test]
+    fn find_index_entry_by_key_returns_entry_and_block_size() {
+        let blocks: Vec<IndexEntry> = (1..=5)
+            .map(|i| {
+                let key = format!("{i}000");
+                IndexEntry {
+                    key: key.into(),
+                    block_offset: 4000_u64,
+                    key_offset: i * 100u16,
+                }
+            })
+            .collect();
+        let index = Index {
+            start: 10_000_u64,
+            blocks,
+            size: 1024,
+        };
+
+        let result = index.find_idx_entry_by_key("2000".as_bytes());
+        assert!(result.is_some());
+        let (entry, size) = result.unwrap();
+        assert_eq!(entry.key, "2000".as_bytes());
+        assert_eq!(entry.block_offset, 4000);
+        assert_eq!(entry.key_offset, 200);
+
+        assert_eq!(size, 6000);
+    }
+
+    #[test]
     fn encode_index_writes_contents_to_buffer() {
         let blocks: Vec<IndexEntry> = (1..=5)
             .map(|i| {
                 let key = "000".to_string();
                 IndexEntry {
                     key: key.into(),
-                    block_offset: i * 1000_u64,
-                    key_offset: 100u16,
+                    block_offset: 4000_u64,
+                    key_offset: i * 100u16,
                 }
             })
             .collect();
@@ -193,7 +241,7 @@ mod tests {
         };
 
         let size = index.size();
-        let mut buf = vec![0; size];
+        let mut buf = Vec::with_capacity(size);
 
         let ok = index.encode(&mut buf);
 

@@ -97,7 +97,7 @@ pub mod storage {
         api::types::Value,
         core::{CoreOptions, CoreStorage},
         iterator::merge_iterator::MergeIterator,
-        memtable::{self, Memtable, MemtableIterator},
+        memtable::{Memtable, MemtableIterator},
     };
 
     use bytes::Bytes;
@@ -146,8 +146,8 @@ pub mod storage {
         fn next(&mut self) -> Option<Self::Item> {
             match self.inner.next() {
                 Some((k, v)) => match v {
-                    memtable::Value::Plain(v) => Some((k.to_vec(), v.to_vec())),
-                    memtable::Value::Tombstone => Some((k.to_vec(), vec![])),
+                    crate::types::Value::Plain(v) => Some((k.to_vec(), v.to_vec())),
+                    crate::types::Value::Tombstone => Some((k.to_vec(), vec![])),
                 },
                 None => None,
             }

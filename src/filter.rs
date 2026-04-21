@@ -11,7 +11,7 @@ pub(crate) trait Filter {
     fn decode(buf: &[u8]) -> Self;
 
     /// Deserialize into a Filter instance from a buffer.
-    fn encode(&self, buf: &mut [u8]);
+    fn encode(&self, buf: &mut Vec<u8>);
 }
 
 /// An immutable bit vector.

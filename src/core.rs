@@ -135,9 +135,17 @@ impl<B: Buffer + Clone> CoreStorage<B> {
                     return Ok(value);
                 }
             }
-        }
 
-        Err(OrchestrationError::Unavailable)
+            let sst = match state.level_zero.iter().rev().find(|sst| sst.probe(&key)) {
+                Some(sst) => sst,
+                None => {
+                    eprintln!("Key {:?} not found in memtables and SSTs.", key);
+                    return Err(OrchestrationError::Unavailable);
+                }
+            };
+
+            sst.fetch(&key).map_err(|_| OrchestrationError::Unavailable)
+        }
     }
 
     pub(crate) fn delete(&self, key: Bytes) -> Result<(), OrchestrationError> {
@@ -245,7 +253,10 @@ mod tests {
     use std::ops::Bound;
 
     use super::*;
-    use crate::memtable::{MemError, Memtable, Value};
+    use crate::{
+        memtable::{MemError, Memtable},
+        types::Value,
+    };
     use bytes::Bytes;
     use temp_dir::TempDir;
 
@@ -507,5 +518,57 @@ mod tests {
         assert_eq!(iter.next().unwrap(), (key, Value::Plain(value_3)));
         assert_eq!(iter.next().unwrap(), (key_2, Value::Plain(value_2)));
         assert_eq!(iter.next().unwrap(), (key_3, Value::Plain(value_1)));
+    }
+
+    #[test]
+    fn get_key_from_sstable_when_not_found_in_any_memtable() {
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path();
+
+        // Current memtable
+        let memtable = test_memtable(3, path.to_path_buf());
+
+        //Oldest memtable
+        let frozen_table_one = test_memtable(1, path.to_path_buf());
+
+        // Intermediate memtable
+        let frozen_table_two = test_memtable(2, path.to_path_buf());
+
+        let key = Bytes::from("Key");
+        let value = Bytes::from("Previous value");
+        let replacement_value = Bytes::from("Current Value");
+
+        let _ = frozen_table_one.put(&key, &value);
+        let _ = frozen_table_one.delete(&key);
+
+        let _ = frozen_table_two.put(&key, &replacement_value);
+
+        let _ = memtable.delete(&key);
+
+        let mut q = VecDeque::new();
+        q.push_back(Arc::new(frozen_table_one));
+        q.push_back(Arc::new(frozen_table_two));
+        let state = State {
+            memtable: Arc::new(memtable),
+            frozen: q,
+            level_zero: vec![],
+        };
+
+        let tempdir = TempDir::new().unwrap();
+        let storage = CoreStorage {
+            cur_memtable_id: AtomicUsize::new(1),
+            state: Arc::new(ArcSwap::new(Arc::new(state))),
+            freeze_lock: Mutex::new(()),
+            options: CoreOptions {
+                data_dir: tempdir.path().to_path_buf(),
+                max_memtable_size: 4,
+                memtable_limit: 3,
+            },
+        };
+
+        let _ = storage.force_flush_all();
+
+        let result = storage.get("Key".into());
+        assert_eq!(result.unwrap(), replacement_value);
     }
 }
