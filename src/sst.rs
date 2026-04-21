@@ -9,8 +9,9 @@ use std::{
 use crate::{
     filter::{Filter, bloom::Bloom},
     index::{Index, IndexBuilder},
+    iterator::block::{BlockIterError, BlockIterator},
     sst::block::{Block, BlockBuilder, MetaBlock},
-    types::{Pair, Value},
+    types::Value,
 };
 use bytes::{Buf, BufMut, Bytes};
 use crossbeam_skiplist::map::Iter;
@@ -24,6 +25,8 @@ pub(crate) const MAX_TABLE_SIZE: usize = 64 * 1024 * 1024;
 pub(crate) const FOOTER_SIZE: usize = 24;
 
 pub(crate) const SST_FILE_PREFIX: &str = "sst";
+
+pub(crate) mod iterator;
 
 ///
 /// The on-disk format of an SSTable is as follows:
@@ -112,6 +115,12 @@ pub(crate) enum SSTableError {
     WriteFailed(#[from] std::io::Error),
     #[error("Unable to recover SSTable from file")]
     FailedToOpen,
+    #[error("Cannot create an iterator for given block")]
+    InvalidBlock,
+    #[error("Block is empty")]
+    EmptyBlock(#[from] BlockIterError),
+    #[error("Key does not exist in this block")]
+    NonexistentKey,
 }
 
 struct WriteableSSTable {
@@ -234,6 +243,12 @@ impl SSTableData {
     }
 }
 
+pub(crate) struct BlockInfo {
+    block_idx: usize,
+    block_offset: u64,
+    block_size: u64,
+}
+
 impl SSTable {
     pub(crate) fn open(id: usize, path: &Path, file: Arc<File>) -> Result<Self, SSTableError> {
         let size: u64 = match file.metadata() {
@@ -270,8 +285,7 @@ impl SSTable {
     }
 
     fn read_at(file: &File, len: usize, offset: u64) -> Result<Vec<u8>, std::io::Error> {
-        let mut buf = Vec::with_capacity(len);
-        buf.resize(len, 0);
+        let mut buf = vec![0; len];
         file.read_exact_at(&mut buf, offset)?;
         Ok(buf)
     }
@@ -290,6 +304,104 @@ impl SSTable {
         } else {
             Err(SSTableError::InitFailed)
         }
+    }
+
+    pub(crate) fn find_block_by_key(&self, key: &Bytes) -> Result<BlockInfo, SSTableError> {
+        if let Some(entry) = self.index.find_idx_entry_by_key(key) {
+            let (idx_entry, block_size) = entry;
+            let block_offset = idx_entry.block_offset();
+
+            let block_idx = match self
+                .meta
+                .block_offsets
+                .iter()
+                .find(|&&offset| offset == block_offset)
+            {
+                Some(idx) => *idx as usize,
+                None => return Err(SSTableError::InvalidBlock),
+            };
+
+            Ok(BlockInfo {
+                block_idx,
+                block_offset,
+                block_size,
+            })
+        } else {
+            Err(SSTableError::NonexistentKey)
+        }
+    }
+
+    pub(crate) fn block_iter(&self, block_idx: usize) -> Result<BlockIterator, SSTableError> {
+        if block_idx >= self.meta.num_blks as usize {
+            return Err(SSTableError::InvalidBlock);
+        }
+
+        let block_start: u64 = match self.meta.block_offsets.get(block_idx) {
+            Some(offset) => *offset,
+            None => return Err(SSTableError::InvalidBlock),
+        };
+
+        let next_offset: u64 = if block_idx == self.meta.block_offsets.len() {
+            self.index.start
+        } else {
+            *self.meta.block_offsets.get(block_idx + 1).unwrap()
+        };
+        let block_size = (next_offset - block_start) as usize;
+
+        let num_entries = *self.meta.count_per_blk.get(block_idx).unwrap();
+        let offset_data_size: usize = U16_SIZE * (num_entries as usize);
+        let offset_data_start = next_offset - offset_data_size as u64;
+
+        let block = self.load_block(
+            block_size,
+            block_start,
+            block_idx,
+            offset_data_start as usize,
+            num_entries as usize,
+        )?;
+
+        match BlockIterator::new(Arc::new(block)) {
+            Ok(iter) => Ok(iter),
+            Err(_) => Err(SSTableError::InvalidBlock),
+        }
+    }
+
+    pub(crate) fn block_iter_by_offset(
+        &self,
+        info: BlockInfo,
+    ) -> Result<BlockIterator, SSTableError> {
+        let num_entries = *self.meta.count_per_blk.get(info.block_idx).unwrap();
+        let offset_data_start = info.block_offset + info.block_size;
+
+        let block = self.load_block(
+            info.block_size as usize,
+            info.block_offset,
+            info.block_idx,
+            offset_data_start as usize,
+            num_entries as usize,
+        )?;
+
+        match BlockIterator::new(Arc::new(block)) {
+            Ok(iter) => Ok(iter),
+            Err(_) => Err(SSTableError::InvalidBlock),
+        }
+    }
+
+    fn load_block(
+        &self,
+        block_size: usize,
+        block_offset: u64,
+        block_idx: usize,
+        offset_data_start: usize,
+        num_entries: usize,
+    ) -> Result<Block, SSTableError> {
+        let mut raw_block = Self::read_at(&self.file, block_size, block_offset)?;
+        Ok(Block::decode_full(
+            &mut raw_block,
+            block_idx,
+            offset_data_start as usize,
+            num_entries as usize,
+        ))
     }
 }
 
@@ -366,6 +478,28 @@ pub(crate) mod block {
 
             let pair = Self::decode_pair(&self.data, offset);
             Ok(pair)
+        }
+
+        pub(crate) fn decode_full(
+            buf: &mut [u8],
+            block_idx: usize,
+            offset_data_start: usize,
+            num_entries: usize,
+        ) -> Self {
+            let data = buf[..offset_data_start].to_vec();
+
+            let mut offsets: Vec<u16> = Vec::with_capacity(num_entries);
+            let mut buf = &buf[offset_data_start..];
+            for _ in 0..num_entries {
+                offsets.push(buf.get_u16_le());
+            }
+
+            Self {
+                id: block_idx,
+                data,
+                offsets,
+                num_entries: num_entries as u16,
+            }
         }
 
         pub(crate) fn decode_pair(buf: &'_ [u8], offset: usize) -> RawPair<'_> {

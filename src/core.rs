@@ -128,7 +128,7 @@ impl<B: Buffer + Clone> CoreStorage<B> {
         let state = self.state.load();
 
         if let Some(value) = state.memtable.get(&key) {
-            return Ok(value);
+            Ok(value)
         } else {
             for immutable_table in state.frozen.clone() {
                 if let Some(value) = immutable_table.get(&key) {

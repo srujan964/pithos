@@ -4,9 +4,10 @@ use bytes::Bytes;
 
 use crate::{iterator::StorageIter, sst::block::Block, types::Pair, types::Value};
 
+#[derive(Debug)]
 pub(crate) struct BlockIterator {
     block: Arc<Block>,
-    first_key: Vec<u8>,
+    pub(crate) first_key: Vec<u8>,
     previous: Option<(Bytes, Value)>,
     idx: usize,
 }
@@ -15,6 +16,8 @@ pub(crate) struct BlockIterator {
 pub(crate) enum BlockIterError {
     #[error("Underlying block has no data")]
     EmptyBlock,
+    #[error("Provided offset does not exist in the current block")]
+    InvalidOffset,
 }
 
 impl BlockIterator {
@@ -31,6 +34,28 @@ impl BlockIterator {
             idx: 0,
         })
     }
+
+    pub(crate) fn new_and_seek_to_offset(
+        block: Arc<Block>,
+        offset: u16,
+    ) -> Result<Self, BlockIterError> {
+        let block = block.clone();
+        if block.data.is_empty() || block.offsets.is_empty() {
+            return Err(BlockIterError::EmptyBlock);
+        }
+
+        let idx = match block.offsets.binary_search(&offset) {
+            Ok(idx) => idx,
+            Err(_) => return Err(BlockIterError::InvalidOffset),
+        };
+
+        Ok(Self {
+            first_key: block.first_key(),
+            block,
+            previous: None,
+            idx,
+        })
+    }
 }
 
 impl StorageIter for BlockIterator {
@@ -45,7 +70,7 @@ impl Iterator for BlockIterator {
     type Item = Pair;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.idx + 1 >= self.block.offsets.len() {
+        if self.idx >= self.block.offsets.len() {
             return None;
         }
 
@@ -134,5 +159,23 @@ mod tests {
             assert_eq!(item.0, Bytes::from(expected_key));
             assert_eq!(item.1, Value::Plain(Bytes::from(expected_value)))
         }
+    }
+
+    #[test]
+    fn block_iterator_starts_at_specific_offset() {
+        let mut blocks = build_block();
+        let block = blocks.pop().unwrap();
+
+        let last_offset = block.offsets.clone().pop().unwrap();
+
+        let mut iter = BlockIterator::new_and_seek_to_offset(Arc::new(block), last_offset).unwrap();
+
+        let item: Option<Pair> = iter.next();
+        let pair = item.unwrap();
+
+        assert_eq!(pair.0, Bytes::from("key_3"));
+        assert_eq!(pair.1, Value::Plain(Bytes::from("value_3")));
+
+        assert!(iter.next().is_none());
     }
 }

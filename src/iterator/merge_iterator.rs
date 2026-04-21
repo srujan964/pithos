@@ -1,5 +1,5 @@
 use crate::iterator::StorageIter;
-use crate::types::Value;
+use crate::types::{Pair, Value};
 
 use bytes::Bytes;
 use std::cmp::Ordering;
@@ -41,8 +41,8 @@ impl PartialEq for HeapItem {
 }
 
 impl<I: StorageIter<KeyVal = (Bytes, Value)>> MergeIterator<I> {
-    pub(crate) fn new(memtable_iters: VecDeque<I>) -> Self {
-        if memtable_iters.is_empty() {
+    pub(crate) fn new(base_iters: VecDeque<I>) -> Self {
+        if base_iters.is_empty() {
             return Self {
                 iters: vec![],
                 heap: BinaryHeap::new(),
@@ -50,10 +50,10 @@ impl<I: StorageIter<KeyVal = (Bytes, Value)>> MergeIterator<I> {
             };
         }
 
-        let mut iters = Vec::with_capacity(memtable_iters.len());
-        let mut heap = BinaryHeap::with_capacity(memtable_iters.len());
+        let mut iters = Vec::with_capacity(base_iters.len());
+        let mut heap = BinaryHeap::with_capacity(base_iters.len());
 
-        for (idx, iter) in memtable_iters.into_iter().enumerate() {
+        for (idx, iter) in base_iters.into_iter().enumerate() {
             let mut iter = iter;
 
             if let Some((k, v)) = StorageIter::next(&mut iter) {
@@ -105,6 +105,46 @@ impl<I: StorageIter<KeyVal = (Bytes, Value)>> Iterator for MergeIterator<I> {
         }
 
         None
+    }
+}
+
+pub(crate) struct MultiMergeIterator<M: StorageIter, S: StorageIter> {
+    memtable_iter: M,
+    sstable_iter: S,
+    first: bool,
+    exhausted: bool,
+}
+
+impl<M: StorageIter, S: StorageIter> MultiMergeIterator<M, S> {
+    pub(crate) fn new(memtable: M, sstable: S) -> Self {
+        Self {
+            memtable_iter: memtable,
+            sstable_iter: sstable,
+            first: true,
+            exhausted: false,
+        }
+    }
+}
+
+impl<M: StorageIter<KeyVal = Pair>, S: StorageIter<KeyVal = Pair>> Iterator
+    for MultiMergeIterator<M, S>
+{
+    type Item = Pair;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.first {
+            let item = StorageIter::next(&mut self.memtable_iter);
+            item.or_else(|| {
+                self.first = false;
+                StorageIter::next(&mut self.sstable_iter)
+            })
+            .or_else(|| {
+                self.exhausted = true;
+                None
+            })
+        } else {
+            None
+        }
     }
 }
 

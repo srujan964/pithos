@@ -90,7 +90,7 @@ impl Index {
             .map(|other| other.block_offset - entry.block_offset)
             .unwrap_or_else(|| self.start - entry.block_offset);
 
-        Some((&entry, block_size))
+        Some((entry, block_size))
     }
 
     pub(crate) fn encode(&self, buf: &mut Vec<u8>) -> bool {
