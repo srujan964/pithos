@@ -1,12 +1,6 @@
 pub mod types {
     use bytes::Buf;
 
-    pub trait Type {
-        fn to_bytes(&self) -> Vec<u8>;
-
-        fn from_bytes(data: &[u8]) -> Self;
-    }
-
     #[derive(thiserror::Error, Debug)]
     pub enum ParseError {
         #[error("Cannot parse bytes to Value type")]

@@ -1,4 +1,5 @@
 pub mod api;
+pub use compaction::CompactionOptions;
 mod block;
 mod compaction;
 mod core;

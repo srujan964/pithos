@@ -55,8 +55,6 @@ pub(crate) struct Memtable {
 pub(crate) enum MemError {
     #[error("WAL directory initialization failure")]
     WalInitFailure(#[from] std::io::Error),
-    #[error("Key already deleted")]
-    ValueTombstoned,
     #[error("Invalid range key")]
     InvalidRange,
     #[error("Unable to freeze memtable")]
@@ -137,12 +135,9 @@ impl Buffer for Memtable {
     }
 
     fn delete(&self, key: &Bytes) -> Result<(), MemError> {
-        self.get(key)
-            .map(|_| {
-                self.size.fetch_add(key.len(), Ordering::Relaxed);
-                self.store.insert(key.clone(), Value::Tombstone);
-            })
-            .ok_or(MemError::ValueTombstoned)
+        self.size.fetch_add(key.len(), Ordering::Relaxed);
+        self.store.insert(key.clone(), Value::Tombstone);
+        Ok(())
     }
 
     fn scan(&self, start: Bound<Bytes>, end: Bound<Bytes>) -> MemtableIterator {
