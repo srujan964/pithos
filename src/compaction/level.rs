@@ -13,6 +13,7 @@ pub struct LeveledCompactionOptions {
     pub base_level_size_mb: usize,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Task {
     pub(crate) input_level: Option<usize>,
     pub(crate) next_level: usize,

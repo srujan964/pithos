@@ -29,7 +29,7 @@ pub mod types {
         pub fn kind(&self) -> &'static str {
             match self {
                 Self::String(_) => "String",
-                Self::Bytes(_) => "bytes",
+                Self::Bytes(_) => "Bytes",
                 Self::Float64(_) => "f64",
                 Self::I64(_) => "i64",
                 Self::U64(_) => "u64",
@@ -37,7 +37,7 @@ pub mod types {
             }
         }
 
-        pub(crate) fn as_bytes(&self) -> Vec<u8> {
+        pub fn as_bytes(&self) -> Vec<u8> {
             let mut buf = vec![];
             match self {
                 Self::String(contents) => {
@@ -69,7 +69,7 @@ pub mod types {
             buf
         }
 
-        pub(crate) fn from_bytes(bytes: Vec<u8>) -> Result<Self, ParseError> {
+        pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, ParseError> {
             let mut buf: &[u8] = bytes.as_ref();
             let identifier: u8 = buf.get_u8();
 
@@ -98,7 +98,7 @@ pub mod storage {
     use crate::{
         api::types::Value,
         compaction::CompactionOptions,
-        core::{CoreOptions, CoreStorage, CoreStorageInner},
+        core::{CoreOptions, CoreStorage},
         iterator::CombinedIterator,
         memtable::Memtable,
     };
@@ -112,20 +112,28 @@ pub mod storage {
         data_dir: String,
         max_memtable_size: usize,
         memtable_limit: usize,
+        compaction_options: CompactionOptions,
     }
 
     impl StorageOptions {
-        pub fn new(data_dir: String, max_memtable_size: usize) -> StorageOptions {
+        pub fn new(
+            data_dir: String,
+            max_memtable_size: usize,
+            compaction_options: CompactionOptions,
+        ) -> StorageOptions {
             StorageOptions {
                 data_dir,
                 max_memtable_size,
                 memtable_limit: NUM_MEMTABLE_LIMIT,
+                compaction_options,
             }
         }
     }
 
     #[derive(Clone, Debug, thiserror::Error)]
     pub enum StorageError {
+        #[error("Unable to open storage")]
+        OpenFailed,
         #[error("Unable to insert value")]
         InsertFailed,
         #[error("Unable to delete key")]
@@ -136,7 +144,7 @@ pub mod storage {
         UnableToClose,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct Storage {
         storage: Arc<CoreStorage<Memtable>>,
     }
@@ -154,7 +162,7 @@ pub mod storage {
             match self.inner.next() {
                 Some((k, v)) => match v {
                     crate::types::Value::Plain(v) => Some((k.to_vec(), v.to_vec())),
-                    crate::types::Value::Tombstone => Some((k.to_vec(), vec![])),
+                    crate::types::Value::Tombstone => unreachable!(),
                 },
                 None => None,
             }
@@ -167,11 +175,11 @@ pub mod storage {
                 data_dir: options.data_dir.into(),
                 max_memtable_size: options.max_memtable_size,
                 memtable_limit: options.memtable_limit,
-                compaction_opts: CompactionOptions::default(),
+                compaction_opts: options.compaction_options,
             })) {
                 Ok(Storage { storage })
             } else {
-                Err(StorageError::IterationFailed)
+                Err(StorageError::OpenFailed)
             }
         }
 

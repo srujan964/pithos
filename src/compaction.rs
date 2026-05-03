@@ -35,10 +35,7 @@ impl Default for CompactionOptions {
     }
 }
 
-pub enum CompactionStrategy {
-    Leveled,
-}
-
+#[derive(Clone, Debug)]
 pub(crate) enum CompactionTask {
     Level(level::Task),
 }
