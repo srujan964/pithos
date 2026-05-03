@@ -93,10 +93,12 @@ pub mod types {
 }
 
 pub mod storage {
+    use std::sync::Arc;
+
     use crate::{
         api::types::Value,
-        compaction::{CompactionOptions, level::LeveledCompactionOptions},
-        core::{CoreOptions, CoreStorage},
+        compaction::CompactionOptions,
+        core::{CoreOptions, CoreStorage, CoreStorageInner},
         iterator::CombinedIterator,
         memtable::Memtable,
     };
@@ -130,11 +132,13 @@ pub mod storage {
         DeleteFailed,
         #[error("Unable to create iterator")]
         IterationFailed,
+        #[error("There was an issue closing the storage")]
+        UnableToClose,
     }
 
     #[derive(Debug)]
     pub struct Storage {
-        storage: CoreStorage<Memtable>,
+        storage: Arc<CoreStorage<Memtable>>,
     }
 
     type IteratorInner = CombinedIterator;
@@ -158,15 +162,17 @@ pub mod storage {
     }
 
     impl Storage {
-        pub fn open(options: StorageOptions) -> Storage {
-            let storage: CoreStorage<Memtable> = CoreStorage::open(Some(CoreOptions {
+        pub fn open(options: StorageOptions) -> Result<Storage, StorageError> {
+            if let Ok(storage) = CoreStorage::open(Some(CoreOptions {
                 data_dir: options.data_dir.into(),
                 max_memtable_size: options.max_memtable_size,
                 memtable_limit: options.memtable_limit,
                 compaction_opts: CompactionOptions::default(),
-            }));
-
-            Storage { storage }
+            })) {
+                Ok(Storage { storage })
+            } else {
+                Err(StorageError::IterationFailed)
+            }
         }
 
         pub fn get(&self, key: Vec<u8>) -> Option<Value> {
@@ -201,7 +207,13 @@ pub mod storage {
         }
 
         pub fn close(&self) -> Result<(), StorageError> {
-            let _ = self.storage.force_flush_all();
+            match self.storage.close() {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Error closing storage: {:?}", e);
+                    return Err(StorageError::UnableToClose);
+                }
+            }
             Ok(())
         }
     }

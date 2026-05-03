@@ -8,8 +8,10 @@ use crate::sst::{SST_FILE_PREFIX, SSTable};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
+use std::fs::File;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -93,6 +95,84 @@ impl<B: Buffer> State<B> {
 
 #[derive(Debug)]
 pub(crate) struct CoreStorage<B> {
+    inner: Arc<CoreStorageInner<B>>,
+    compaction_notifier: crossbeam_channel::Sender<()>,
+    flush_notifier: crossbeam_channel::Sender<()>,
+    compaction_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    flush_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl<B> CoreStorage<B>
+where
+    B: Buffer + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn open(options: Option<CoreOptions>) -> Result<Arc<Self>, OrchestrationError> {
+        let inner = Arc::new(CoreStorageInner::open(options));
+
+        let (comp_tx, comp_rx) = crossbeam_channel::unbounded();
+        let (flush_tx, flush_rx) = crossbeam_channel::unbounded();
+
+        let compaction_thread = inner.spawn_compaction_thread(comp_rx)?;
+        let flush_thread = inner.spawn_flush_thread(flush_rx)?;
+
+        Ok(Arc::new(CoreStorage {
+            inner,
+            compaction_notifier: comp_tx,
+            flush_notifier: flush_tx,
+            compaction_thread: Mutex::new(compaction_thread),
+            flush_thread: Mutex::new(flush_thread),
+        }))
+    }
+
+    pub(crate) fn close(&self) -> Result<(), OrchestrationError> {
+        self.inner.sync()?;
+
+        self.compaction_notifier.send(()).ok();
+        self.flush_notifier.send(()).ok();
+
+        let mut compaction_thread = self.compaction_thread.lock().unwrap();
+        if let Some(compaction_thread) = compaction_thread.take() {
+            compaction_thread
+                .join()
+                .map_err(|e| OrchestrationError::CloseError(e))?;
+        }
+
+        let mut flush_thread = self.flush_thread.lock().unwrap();
+        if let Some(flush_thread) = flush_thread.take() {
+            flush_thread
+                .join()
+                .map_err(|e| OrchestrationError::CloseError(e))?;
+        }
+
+        self.inner.force_flush_all()?;
+        self.inner.sync()?;
+
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, key: Bytes) -> Result<Bytes, OrchestrationError> {
+        self.inner.get(key)
+    }
+
+    pub(crate) fn put(&self, key: Bytes, value: Bytes) -> Result<(), OrchestrationError> {
+        self.inner.put(key, value)
+    }
+
+    pub(crate) fn delete(&self, key: Bytes) -> Result<(), OrchestrationError> {
+        self.inner.delete(key)
+    }
+
+    pub(crate) fn scan(
+        &self,
+        start: Bytes,
+        end: Bytes,
+    ) -> Result<CombinedIterator, OrchestrationError> {
+        self.inner.scan(start, end)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CoreStorageInner<B> {
     cur_memtable_id: AtomicUsize,
     pub(crate) state: Arc<ArcSwap<State<B>>>,
     freeze_lock: Mutex<()>,
@@ -101,6 +181,8 @@ pub(crate) struct CoreStorage<B> {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OrchestrationError {
+    #[error("Data directory unavailable")]
+    MissingDataDir,
     #[error("Underlying storage system unavailable")]
     Unavailable,
     #[error("No frozen memtables found")]
@@ -109,9 +191,11 @@ pub(crate) enum OrchestrationError {
     FlushFailure,
     #[error("Compaction failed")]
     CompactionFailure,
+    #[error("Error closing thread")]
+    CloseError(Box<dyn Any + Send + 'static>),
 }
 
-impl<B> CoreStorage<B>
+impl<B> CoreStorageInner<B>
 where
     B: Buffer + Clone + Send + Sync + 'static,
 {
@@ -137,6 +221,17 @@ where
             freeze_lock: Mutex::new(()),
             options: options.clone(),
         }
+    }
+
+    pub(crate) fn sync(&self) -> Result<(), OrchestrationError> {
+        match File::open(self.options.data_dir.clone()) {
+            Ok(dir) => {
+                let _ = dir.sync_all();
+            }
+            Err(_) => return Err(OrchestrationError::Unavailable),
+        }
+
+        Ok(())
     }
 
     pub(crate) fn put(&self, key: Bytes, value: Bytes) -> Result<(), OrchestrationError> {
@@ -487,14 +582,14 @@ mod tests {
     fn init_storage<B: Buffer + Clone + Send + Sync + 'static>(
         size: usize,
         path: PathBuf,
-    ) -> CoreStorage<B> {
+    ) -> CoreStorageInner<B> {
         let options = CoreOptions {
             max_memtable_size: size,
             data_dir: path.to_path_buf(),
             memtable_limit: 3,
             compaction_opts: CompactionOptions::default(),
         };
-        CoreStorage::open(Some(options))
+        CoreStorageInner::open(Some(options))
     }
 
     #[test]
@@ -619,7 +714,7 @@ mod tests {
             sstables: HashMap::new(),
         };
 
-        let storage = CoreStorage {
+        let storage = CoreStorageInner {
             cur_memtable_id: AtomicUsize::new(1),
             state: Arc::new(ArcSwap::new(Arc::new(state))),
             freeze_lock: Mutex::new(()),
@@ -679,7 +774,7 @@ mod tests {
         };
 
         let tempdir = TempDir::new().unwrap();
-        let storage = CoreStorage {
+        let storage = CoreStorageInner {
             cur_memtable_id: AtomicUsize::new(1),
             state: Arc::new(ArcSwap::new(Arc::new(state))),
             freeze_lock: Mutex::new(()),
@@ -749,7 +844,7 @@ mod tests {
             sstables: HashMap::new(),
         };
 
-        let storage = CoreStorage {
+        let storage = CoreStorageInner {
             cur_memtable_id: AtomicUsize::new(1),
             state: Arc::new(ArcSwap::new(Arc::new(state))),
             freeze_lock: Mutex::new(()),

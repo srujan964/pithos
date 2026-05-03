@@ -9,7 +9,7 @@ use bytes::Bytes;
 use crate::{
     block,
     compaction::level::LeveledCompactionOptions,
-    core::{CoreStorage, OrchestrationError, State},
+    core::{CoreStorageInner, OrchestrationError, State},
     iterator::{StorageIter, merge_iterator::MultiMergeIterator},
     memtable::Buffer,
     sst::{self, SSTable, iterator::ConcatenatingIterator},
@@ -17,8 +17,6 @@ use crate::{
 };
 
 pub(crate) mod level;
-
-use level::Task;
 
 #[derive(Clone, Debug)]
 pub enum CompactionOptions {
@@ -50,7 +48,6 @@ pub(crate) enum CompactionError {
     #[error("L0 threshold needs to be > 1")]
     InvalidL0Threshold,
 }
-
 
 #[derive(Clone, Debug)]
 pub(crate) struct Level {
@@ -122,7 +119,7 @@ impl FileMetadata {
     }
 }
 
-impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorage<B> {
+impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorageInner<B> {
     pub(crate) fn generate_compaction_task(&self, state: &State<B>) -> Option<CompactionTask> {
         match &self.options.compaction_opts {
             CompactionOptions::Leveled(opts) => {
@@ -213,14 +210,26 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorage<B> {
                 state.level_zero = state
                     .level_zero
                     .iter()
-                    .filter_map(|id| if upper_ids.remove(id) { None } else { Some(*id) })
+                    .filter_map(|id| {
+                        if upper_ids.remove(id) {
+                            None
+                        } else {
+                            Some(*id)
+                        }
+                    })
                     .collect();
             }
             Some(lvl) => {
                 state.levels[lvl - 1].1 = state.levels[lvl - 1]
                     .1
                     .iter()
-                    .filter_map(|id| if upper_ids.remove(id) { None } else { Some(*id) })
+                    .filter_map(|id| {
+                        if upper_ids.remove(id) {
+                            None
+                        } else {
+                            Some(*id)
+                        }
+                    })
                     .collect();
             }
         }
@@ -231,7 +240,13 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorage<B> {
         let mut new_lower: Vec<usize> = state.levels[task.next_level - 1]
             .1
             .iter()
-            .filter_map(|id| if lower_ids.remove(id) { None } else { Some(*id) })
+            .filter_map(|id| {
+                if lower_ids.remove(id) {
+                    None
+                } else {
+                    Some(*id)
+                }
+            })
             .collect();
 
         new_lower.extend(output);

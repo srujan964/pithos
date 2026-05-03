@@ -310,10 +310,6 @@ mod tests {
                 Value::Plain(Bytes::from("key_1_value_2"))
             )
         );
-        // assert_eq!(
-        //     *result_iter.next().unwrap(),
-        //     (Bytes::from("key_2"), Value::Tombstone)
-        // );
         assert_eq!(
             *result_iter.next().unwrap(),
             (
@@ -358,10 +354,6 @@ mod tests {
         }
         let mut result_iter = result.iter();
 
-        // assert_eq!(
-        //     *result_iter.next().unwrap(),
-        //     (Bytes::from("key_2"), Value::Tombstone)
-        // );
         assert_eq!(
             *result_iter.next().unwrap(),
             (
