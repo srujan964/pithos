@@ -164,6 +164,12 @@ pub mod storage {
     }
 
     impl Storage {
+        ///
+        /// Creates a new `Storage` instance.
+        ///
+        /// This can possibly fail - for eg. it returns an error if it cannot set up flush and
+        /// compaction threads.
+        ///
         pub fn open(options: StorageOptions) -> Result<Storage, StorageError> {
             if let Ok(storage) = CoreStorage::open(Some(CoreOptions {
                 data_dir: options.data_dir.into(),
@@ -177,6 +183,9 @@ pub mod storage {
             }
         }
 
+        ///
+        /// Get the value of a key.
+        ///
         pub fn get(&self, key: Vec<u8>) -> Option<Value> {
             match self.storage.get(Bytes::from(key)) {
                 Ok(bytes) => Value::from_bytes(bytes.to_vec()).ok(),
@@ -184,6 +193,9 @@ pub mod storage {
             }
         }
 
+        ///
+        /// Insert a new key-value pair. Overwrites any previous value if it exists.
+        ///
         pub fn put(&self, key: Vec<u8>, value: Value) -> Result<(), StorageError> {
             let value = value.as_bytes();
             self.storage
@@ -191,12 +203,18 @@ pub mod storage {
                 .map_err(|_| StorageError::InsertFailed)
         }
 
+        ///
+        /// Deletes a key from storage.
+        ///
         pub fn delete(&self, key: Vec<u8>) -> Result<(), StorageError> {
             self.storage
                 .delete(Bytes::from(key))
                 .map_err(|_| StorageError::DeleteFailed)
         }
 
+        ///
+        /// Scan for key-value pairs in a given range, inclusive of both `start` and `end`.
+        ///
         pub fn scan(
             &self,
             start: Vec<u8>,
@@ -208,6 +226,12 @@ pub mod storage {
             }
         }
 
+        ///
+        /// Close an existing storage instance.
+        ///
+        /// All underlying threads are closed and an attempt is made to flush persisted data
+        /// to disk.
+        ///
         pub fn close(&self) -> Result<(), StorageError> {
             match self.storage.close() {
                 Ok(_) => {}
