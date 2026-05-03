@@ -95,9 +95,10 @@ pub mod types {
 pub mod storage {
     use crate::{
         api::types::Value,
+        compaction::{CompactionOptions, level::LeveledCompactionOptions},
         core::{CoreOptions, CoreStorage},
-        iterator::merge_iterator::MergeIterator,
-        memtable::{Memtable, MemtableIterator},
+        iterator::CombinedIterator,
+        memtable::Memtable,
     };
 
     use bytes::Bytes;
@@ -127,6 +128,8 @@ pub mod storage {
         InsertFailed,
         #[error("Unable to delete key")]
         DeleteFailed,
+        #[error("Unable to create iterator")]
+        IterationFailed,
     }
 
     #[derive(Debug)]
@@ -134,7 +137,7 @@ pub mod storage {
         storage: CoreStorage<Memtable>,
     }
 
-    type IteratorInner = MergeIterator<MemtableIterator>;
+    type IteratorInner = CombinedIterator;
 
     pub struct Iterator {
         inner: IteratorInner,
@@ -156,10 +159,11 @@ pub mod storage {
 
     impl Storage {
         pub fn open(options: StorageOptions) -> Storage {
-            let storage: CoreStorage<Memtable> = CoreStorage::new(Some(CoreOptions {
+            let storage: CoreStorage<Memtable> = CoreStorage::open(Some(CoreOptions {
                 data_dir: options.data_dir.into(),
                 max_memtable_size: options.max_memtable_size,
                 memtable_limit: options.memtable_limit,
+                compaction_opts: CompactionOptions::default(),
             }));
 
             Storage { storage }
@@ -185,9 +189,14 @@ pub mod storage {
                 .map_err(|_| StorageError::DeleteFailed)
         }
 
-        pub fn scan(&self, start: Vec<u8>, end: Vec<u8>) -> crate::api::storage::Iterator {
-            crate::api::storage::Iterator {
-                inner: self.storage.scan(Bytes::from(start), Bytes::from(end)),
+        pub fn scan(
+            &self,
+            start: Vec<u8>,
+            end: Vec<u8>,
+        ) -> Result<crate::api::storage::Iterator, StorageError> {
+            match self.storage.scan(Bytes::from(start), Bytes::from(end)) {
+                Ok(iter) => Ok(crate::api::storage::Iterator { inner: iter }),
+                Err(_) => Err(StorageError::IterationFailed),
             }
         }
 

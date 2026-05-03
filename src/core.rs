@@ -1,18 +1,22 @@
-use crate::iterator::merge_iterator::MergeIterator;
+use crate::compaction::{CompactionOptions, level::LeveledCompactionOptions};
+use crate::iterator::CombinedIterator;
+use crate::iterator::merge_iterator::{MergeIterator, MultiMergeIterator};
 use crate::memtable::{self, Buffer, MemtableIterator, TableOptions};
-use crate::sst::SSTable;
+use crate::sst::iterator::{ConcatenatingIterator, SSTableIterator};
+use crate::sst::{SST_FILE_PREFIX, SSTable};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::ops::Bound;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, MutexGuard,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 use std::vec;
 
 pub(crate) const DATA_DIR: &str = "/usr/local/pithos/data";
@@ -22,6 +26,7 @@ pub(crate) struct CoreOptions {
     pub(crate) data_dir: PathBuf,
     pub(crate) max_memtable_size: usize,
     pub(crate) memtable_limit: usize,
+    pub(crate) compaction_opts: CompactionOptions,
 }
 
 impl Default for CoreOptions {
@@ -30,15 +35,18 @@ impl Default for CoreOptions {
             data_dir: PathBuf::from(DATA_DIR),
             max_memtable_size: memtable::MAX_TABLE_SIZE,
             memtable_limit: 3,
+            compaction_opts: CompactionOptions::default(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-struct State<B> {
-    memtable: Arc<B>,
-    frozen: VecDeque<Arc<B>>,
-    level_zero: Vec<SSTable>,
+pub(crate) struct State<B> {
+    pub(crate) memtable: Arc<B>,
+    pub(crate) frozen: VecDeque<Arc<B>>,
+    pub(crate) level_zero: Vec<usize>,
+    pub(crate) levels: Vec<(usize, Vec<usize>)>,
+    pub(crate) sstables: HashMap<usize, Arc<SSTable>>,
 }
 
 impl<B: Buffer> State<B> {
@@ -52,25 +60,32 @@ impl<B: Buffer> State<B> {
             memtable: Arc::new(new_memtable),
             frozen,
             level_zero: self.level_zero.clone(),
+            levels: self.levels.clone(),
+            sstables: self.sstables.clone(),
         }
     }
 
     fn flush_oldest(&self, sst: SSTable) -> Result<Self, OrchestrationError> {
         let mut level_zero = self.level_zero.clone();
         let mut frozen = self.frozen.clone();
+        let mut sstables = self.sstables.clone();
 
-        match frozen.pop_back() {
+        match frozen.pop_front() {
             Some(_) => {}
             None => {
                 return Err(OrchestrationError::NothingToFlush);
             }
         }
 
-        level_zero.insert(0, sst);
+        level_zero.insert(0, sst.id());
+        sstables.insert(sst.id(), Arc::new(sst));
+
         let new = Self {
             memtable: self.memtable.clone(),
             frozen,
             level_zero,
+            levels: self.levels.clone(),
+            sstables,
         };
         Ok(new)
     }
@@ -79,9 +94,9 @@ impl<B: Buffer> State<B> {
 #[derive(Debug)]
 pub(crate) struct CoreStorage<B> {
     cur_memtable_id: AtomicUsize,
-    state: Arc<ArcSwap<State<B>>>,
+    pub(crate) state: Arc<ArcSwap<State<B>>>,
     freeze_lock: Mutex<()>,
-    options: CoreOptions,
+    pub(crate) options: CoreOptions,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -92,10 +107,15 @@ pub(crate) enum OrchestrationError {
     NothingToFlush,
     #[error("Failed to create SSTable")]
     FlushFailure,
+    #[error("Compaction failed")]
+    CompactionFailure,
 }
 
-impl<B: Buffer + Clone> CoreStorage<B> {
-    pub(crate) fn new(options: Option<CoreOptions>) -> Self {
+impl<B> CoreStorage<B>
+where
+    B: Buffer + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn open(options: Option<CoreOptions>) -> Self {
         let memtable_id = 1;
         let options = options.unwrap_or_default();
         let table_options = TableOptions::new(options.max_memtable_size, &options.data_dir);
@@ -104,8 +124,13 @@ impl<B: Buffer + Clone> CoreStorage<B> {
             memtable: Arc::new(memtable),
             frozen: VecDeque::new(),
             level_zero: vec![],
+            levels: match options.compaction_opts {
+                CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. }) => {
+                    (0..max_levels).map(|l| (l, vec![])).collect()
+                }
+            },
+            sstables: HashMap::new(),
         };
-
         Self {
             cur_memtable_id: AtomicUsize::new(memtable_id),
             state: Arc::new(ArcSwap::new(Arc::new(state))),
@@ -136,15 +161,23 @@ impl<B: Buffer + Clone> CoreStorage<B> {
                 }
             }
 
-            let sst = match state.level_zero.iter().rev().find(|sst| sst.probe(&key)) {
-                Some(sst) => sst,
-                None => {
-                    eprintln!("Key {:?} not found in memtables and SSTs.", key);
-                    return Err(OrchestrationError::Unavailable);
-                }
-            };
+            let sst_ids: Vec<_> = state.level_zero.iter().collect();
 
-            sst.fetch(&key).map_err(|_| OrchestrationError::Unavailable)
+            for id in sst_ids {
+                let found = match state.sstables.get(id) {
+                    Some(sst) if sst.probe(&key) => {
+                        sst.fetch(&key).map_err(|_| OrchestrationError::Unavailable)
+                    }
+                    Some(_sst) => Err(OrchestrationError::Unavailable),
+                    None => Err(OrchestrationError::Unavailable),
+                };
+
+                if found.is_ok() {
+                    return found;
+                }
+            }
+
+            Err(OrchestrationError::Unavailable)
         }
     }
 
@@ -157,10 +190,14 @@ impl<B: Buffer + Clone> CoreStorage<B> {
             .map_err(|_| OrchestrationError::Unavailable)
     }
 
-    pub(crate) fn scan(&self, start: Bytes, end: Bytes) -> MergeIterator<MemtableIterator> {
+    pub(crate) fn scan(
+        &self,
+        start: Bytes,
+        end: Bytes,
+    ) -> Result<CombinedIterator, OrchestrationError> {
         let state = self.state.load();
-        let lower_bound = Bound::Included(start);
-        let upper_bound = Bound::Included(end);
+        let lower_bound = Bound::Included(start.clone());
+        let upper_bound = Bound::Included(end.clone());
         let mut iters: VecDeque<MemtableIterator> = VecDeque::with_capacity(state.frozen.len() + 1);
 
         iters.push_back(
@@ -173,7 +210,41 @@ impl<B: Buffer + Clone> CoreStorage<B> {
             iters.push_back(memtable.scan(lower_bound.clone(), upper_bound.clone()));
         }
 
-        MergeIterator::new(iters)
+        let memtable_iter = MergeIterator::new(iters);
+
+        let mut sst_iters = VecDeque::new();
+        for id in state.level_zero.iter() {
+            let l0_sst = state.sstables[id].clone();
+            if !should_traverse(l0_sst.first_key(), l0_sst.last_key(), &start, &end) {
+                continue;
+            }
+
+            if let Ok(iter) = SSTableIterator::new_and_seek_to_key(l0_sst, &start) {
+                sst_iters.push_back(iter);
+            }
+        }
+
+        let l0_iter = MergeIterator::new(sst_iters);
+
+        let mut level_n_iters = VecDeque::with_capacity(state.levels.len());
+        for (_, level_sst_ids) in &state.levels {
+            let mut level_ssts = Vec::with_capacity(level_sst_ids.len());
+            for id in level_sst_ids {
+                let sst = state.sstables[id].clone();
+                if should_traverse(sst.first_key(), sst.last_key(), &start, &end) {
+                    level_ssts.push(sst);
+                }
+            }
+
+            if let Ok(level_iter) = ConcatenatingIterator::new_and_seek_to_key(level_ssts, &start) {
+                level_n_iters.push_back(level_iter);
+            };
+        }
+
+        let iter = MultiMergeIterator::new(memtable_iter, l0_iter);
+        let iter = MultiMergeIterator::new(iter, MergeIterator::new(level_n_iters));
+
+        Ok(CombinedIterator::new(iter, &end))
     }
 
     fn try_freeze(&self) -> Result<(), OrchestrationError> {
@@ -223,16 +294,17 @@ impl<B: Buffer + Clone> CoreStorage<B> {
     ) -> Result<(), OrchestrationError> {
         let oldest;
         let state = self.state.load();
-        match state.frozen.back() {
+        match state.frozen.front() {
             Some(memtable) => oldest = memtable.clone(),
             None => {
                 return Err(OrchestrationError::NothingToFlush);
             }
         }
 
-        let sst = match oldest.flush() {
+        let sst = match oldest.flush(self.get_sst_path(oldest.id())) {
             Ok(sst) => sst,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("Failed to flush: {}", e);
                 return Err(OrchestrationError::FlushFailure);
             }
         };
@@ -242,10 +314,107 @@ impl<B: Buffer + Clone> CoreStorage<B> {
         })
     }
 
-    fn next_memtable_id(&self) -> usize {
+    pub(crate) fn trigger_compact(&self) -> Result<(), OrchestrationError> {
+        let state = self.state.load_full();
+
+        let task = self.generate_compaction_task(&state);
+
+        let Some(task) = task else {
+            return Ok(());
+        };
+
+        let sstables = self.compact(&task)?;
+        let new_files = sstables.len();
+        let new_sst_ids: Vec<usize> = sstables.iter().map(|sst| sst.id()).collect();
+        let ssts_to_remove = {
+            let _state_lock = self.freeze_lock.lock().unwrap();
+            let (mut new_state, files_to_remove) =
+                self.apply_compaction_result(&self.state.load_full(), &task, &new_sst_ids);
+
+            let mut ssts_to_remove = Vec::with_capacity(files_to_remove.len());
+
+            for file in &files_to_remove {
+                let removed = new_state.sstables.remove(file);
+                if let Some(id) = removed {
+                    ssts_to_remove.push(id);
+                };
+            }
+
+            let mut new_sst_ids = Vec::new();
+            for file_to_add in sstables {
+                new_sst_ids.push(file_to_add.id());
+                new_state.sstables.insert(file_to_add.id(), file_to_add);
+            }
+            self.state.swap(Arc::new(new_state));
+            ssts_to_remove
+        };
+        println!(
+            "Compaction completed. {} files removed. {} files added.",
+            ssts_to_remove.len(),
+            new_files
+        );
+
+        for sst in ssts_to_remove {
+            let _ = std::fs::remove_file(self.get_sst_path(sst.id()));
+        }
+
+        Ok(())
+    }
+
+    fn trigger_flush(&self) -> Result<(), OrchestrationError> {
+        let state = self.state.load();
+
+        if state.frozen.len() >= self.options.memtable_limit {
+            let state_lock = self.freeze_lock.lock().unwrap();
+            match self.flush_oldest_memtable(&state_lock) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Error during flush: {}", e);
+                    drop(state_lock);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn spawn_flush_thread(
+        self: &Arc<Self>,
+        rx: crossbeam_channel::Receiver<()>,
+    ) -> Result<Option<std::thread::JoinHandle<()>>, OrchestrationError> {
+        let this = self.clone();
+        let handle = std::thread::spawn(move || {
+            let ticker = crossbeam_channel::tick(Duration::from_millis(50));
+            loop {
+                crossbeam_channel::select! {
+                    recv(ticker) -> _ => if let Err(e) = this.trigger_flush() {
+                        eprintln!("Flush failed: {}", e);
+                    },
+                    recv(rx) -> _ => return
+                }
+            }
+        });
+
+        Ok(Some(handle))
+    }
+
+    pub(crate) fn next_memtable_id(&self) -> usize {
         self.cur_memtable_id.fetch_add(1, Ordering::SeqCst);
         self.cur_memtable_id.load(Ordering::SeqCst)
     }
+
+    pub(crate) fn get_sst_path(&self, id: usize) -> PathBuf {
+        Self::sst_path(&self.options.data_dir, id)
+    }
+
+    fn sst_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
+        path.as_ref()
+            .join(format!("{}-{:05}.sst", SST_FILE_PREFIX, id))
+    }
+}
+
+fn should_traverse(table_start: &[u8], table_end: &[u8], start: &[u8], end: &[u8]) -> bool {
+    !(start > table_end || end < table_start)
 }
 
 #[cfg(test)]
@@ -310,18 +479,22 @@ mod tests {
             todo!()
         }
 
-        fn flush(&self) -> Result<SSTable, MemError> {
+        fn flush(&self, path: PathBuf) -> Result<SSTable, MemError> {
             todo!()
         }
     }
 
-    fn init_storage<B: Buffer + Clone>(size: usize, path: PathBuf) -> CoreStorage<B> {
+    fn init_storage<B: Buffer + Clone + Send + Sync + 'static>(
+        size: usize,
+        path: PathBuf,
+    ) -> CoreStorage<B> {
         let options = CoreOptions {
             max_memtable_size: size,
             data_dir: path.to_path_buf(),
             memtable_limit: 3,
+            compaction_opts: CompactionOptions::default(),
         };
-        CoreStorage::new(Some(options))
+        CoreStorage::open(Some(options))
     }
 
     #[test]
@@ -394,7 +567,7 @@ mod tests {
                 todo!()
             }
 
-            fn flush(&self) -> Result<SSTable, MemError> {
+            fn flush(&self, path: PathBuf) -> Result<SSTable, MemError> {
                 todo!()
             }
         }
@@ -442,17 +615,19 @@ mod tests {
             memtable: Arc::new(memtable),
             frozen: q,
             level_zero: vec![],
+            levels: (0..=4).map(|l| (l, vec![])).collect(),
+            sstables: HashMap::new(),
         };
 
-        let tempdir = TempDir::new().unwrap();
         let storage = CoreStorage {
             cur_memtable_id: AtomicUsize::new(1),
             state: Arc::new(ArcSwap::new(Arc::new(state))),
             freeze_lock: Mutex::new(()),
             options: CoreOptions {
-                data_dir: tempdir.path().to_path_buf(),
+                data_dir: path.to_path_buf(),
                 max_memtable_size: 4,
                 memtable_limit: 3,
+                compaction_opts: CompactionOptions::default(),
             },
         };
 
@@ -499,6 +674,8 @@ mod tests {
             memtable: Arc::new(memtable),
             frozen: q,
             level_zero: vec![],
+            levels: (0..=4).map(|l| (l, vec![])).collect(),
+            sstables: HashMap::new(),
         };
 
         let tempdir = TempDir::new().unwrap();
@@ -510,11 +687,14 @@ mod tests {
                 data_dir: tempdir.path().to_path_buf(),
                 max_memtable_size: 4,
                 memtable_limit: 3,
+                compaction_opts: CompactionOptions::default(),
             },
         };
 
-        let mut iter = storage.scan(key.clone(), key_3.clone());
+        let iter = storage.scan(key.clone(), key_3.clone());
+        assert!(iter.is_ok());
 
+        let mut iter = iter.unwrap();
         assert_eq!(iter.next().unwrap(), (key, Value::Plain(value_3)));
         assert_eq!(iter.next().unwrap(), (key_2, Value::Plain(value_2)));
         assert_eq!(iter.next().unwrap(), (key_3, Value::Plain(value_1)));
@@ -525,23 +705,36 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let path = tempdir.path();
 
-        // Current memtable
-        let memtable = test_memtable(3, path.to_path_buf());
-
         //Oldest memtable
         let frozen_table_one = test_memtable(1, path.to_path_buf());
 
         // Intermediate memtable
         let frozen_table_two = test_memtable(2, path.to_path_buf());
 
-        let key = Bytes::from("Key");
-        let value = Bytes::from("Previous value");
-        let replacement_value = Bytes::from("Current Value");
+        // Current memtable
+        let memtable = test_memtable(3, path.to_path_buf());
+
+        let key = Bytes::from("new_key");
+        let value = Bytes::from("previous value");
+        let replacement_value = Bytes::from("current value");
+
+        let scanning_key_1 = Bytes::from("key_1");
+        let scanning_value_1 = Bytes::from("value_1");
+
+        let scanning_key_2 = Bytes::from("key_2");
+        let scanning_value_2 = Bytes::from("value_2");
+
+        let scanning_key_3 = Bytes::from("key_3");
+        let scanning_value_3 = Bytes::from("value_3");
 
         let _ = frozen_table_one.put(&key, &value);
         let _ = frozen_table_one.delete(&key);
+        let _ = frozen_table_one.put(&scanning_key_3, &scanning_value_3);
+        let _ = frozen_table_one.put(&scanning_key_2, &scanning_value_2);
 
         let _ = frozen_table_two.put(&key, &replacement_value);
+        let _ = frozen_table_two.put(&scanning_key_1, &scanning_value_1);
+        let _ = frozen_table_two.put(&scanning_key_2, &scanning_value_1);
 
         let _ = memtable.delete(&key);
 
@@ -552,23 +745,51 @@ mod tests {
             memtable: Arc::new(memtable),
             frozen: q,
             level_zero: vec![],
+            levels: (0..=4).map(|l| (l, vec![])).collect(),
+            sstables: HashMap::new(),
         };
 
-        let tempdir = TempDir::new().unwrap();
         let storage = CoreStorage {
             cur_memtable_id: AtomicUsize::new(1),
             state: Arc::new(ArcSwap::new(Arc::new(state))),
             freeze_lock: Mutex::new(()),
             options: CoreOptions {
-                data_dir: tempdir.path().to_path_buf(),
+                data_dir: path.to_path_buf(),
                 max_memtable_size: 4,
                 memtable_limit: 3,
+                compaction_opts: CompactionOptions::default(),
             },
         };
 
         let _ = storage.force_flush_all();
 
-        let result = storage.get("Key".into());
+        let result = storage.get(key);
         assert_eq!(result.unwrap(), replacement_value);
+
+        let full_storage_iter = storage.scan(scanning_key_1.clone(), scanning_key_3.clone());
+        assert!(full_storage_iter.is_ok());
+
+        let mut full_storage_iter = full_storage_iter.unwrap();
+        assert_eq!(
+            full_storage_iter.next().unwrap(),
+            (
+                scanning_key_1.clone(),
+                Value::Plain(scanning_value_1.clone())
+            )
+        );
+        assert_eq!(
+            full_storage_iter.next().unwrap(),
+            (
+                scanning_key_2.clone(),
+                Value::Plain(scanning_value_1.clone())
+            )
+        );
+        assert_eq!(
+            full_storage_iter.next().unwrap(),
+            (
+                scanning_key_3.clone(),
+                Value::Plain(scanning_value_3.clone())
+            )
+        );
     }
 }

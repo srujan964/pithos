@@ -75,6 +75,14 @@ impl<I: StorageIter<KeyVal = (Bytes, Value)>> MergeIterator<I> {
     }
 }
 
+impl<I: StorageIter<KeyVal = Pair>> StorageIter for MergeIterator<I> {
+    type KeyVal = Pair;
+
+    fn next(&mut self) -> Option<Self::KeyVal> {
+        std::iter::Iterator::next(self)
+    }
+}
+
 impl<I: StorageIter<KeyVal = (Bytes, Value)>> Iterator for MergeIterator<I> {
     type Item = (Bytes, Value);
 
@@ -88,20 +96,28 @@ impl<I: StorageIter<KeyVal = (Bytes, Value)>> Iterator for MergeIterator<I> {
 
             if let Some((k, v)) = StorageIter::next(&mut self.iters[iter_idx]) {
                 self.heap.push(HeapItem {
-                    key: k.clone(),
-                    value: v.clone(),
+                    key: k,
+                    value: v,
                     iter_idx,
                 })
             }
 
-            if let Some(last) = &self.last_key
-                && *last == key
-            {
-                continue;
+            if let Some(last) = &self.last_key {
+                if *last == key {
+                    continue;
+                }
             }
 
             self.last_key = Some(key.clone());
-            return Some((key.clone(), value.clone()));
+
+            match value {
+                Value::Tombstone => {
+                    continue;
+                }
+                Value::Plain(_) => {
+                    return Some((key.clone(), value.clone()));
+                }
+            }
         }
 
         None
@@ -109,20 +125,36 @@ impl<I: StorageIter<KeyVal = (Bytes, Value)>> Iterator for MergeIterator<I> {
 }
 
 pub(crate) struct MultiMergeIterator<M: StorageIter, S: StorageIter> {
-    memtable_iter: M,
-    sstable_iter: S,
-    first: bool,
-    exhausted: bool,
+    a: M,
+    b: S,
+    cur_a: Option<M::Item>,
+    cur_b: Option<S::Item>,
 }
 
 impl<M: StorageIter, S: StorageIter> MultiMergeIterator<M, S> {
-    pub(crate) fn new(memtable: M, sstable: S) -> Self {
-        Self {
-            memtable_iter: memtable,
-            sstable_iter: sstable,
-            first: true,
-            exhausted: false,
-        }
+    pub(crate) fn new(mut a: M, mut b: S) -> Self {
+        let cur_a = Iterator::next(&mut a);
+        let cur_b = Iterator::next(&mut b);
+
+        Self { a, b, cur_a, cur_b }
+    }
+
+    fn advance_first(&mut self) {
+        self.cur_a = Iterator::next(&mut self.a);
+    }
+
+    fn advance_second(&mut self) {
+        self.cur_b = Iterator::next(&mut self.b);
+    }
+}
+
+impl<M: StorageIter<KeyVal = Pair>, S: StorageIter<KeyVal = Pair>> StorageIter
+    for MultiMergeIterator<M, S>
+{
+    type KeyVal = Pair;
+
+    fn next(&mut self) -> Option<Self::KeyVal> {
+        std::iter::Iterator::next(self)
     }
 }
 
@@ -132,18 +164,37 @@ impl<M: StorageIter<KeyVal = Pair>, S: StorageIter<KeyVal = Pair>> Iterator
     type Item = Pair;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.first {
-            let item = StorageIter::next(&mut self.memtable_iter);
-            item.or_else(|| {
-                self.first = false;
-                StorageIter::next(&mut self.sstable_iter)
-            })
-            .or_else(|| {
-                self.exhausted = true;
-                None
-            })
-        } else {
-            None
+        match (&self.cur_a, &self.cur_b) {
+            (None, None) => None,
+            (None, Some(_)) => {
+                let ret = self.cur_b.take();
+                self.advance_second();
+                ret
+            }
+            (Some(_), None) => {
+                let ret = self.cur_a.take();
+                self.advance_first();
+                ret
+            }
+            (Some((key_1, _)), Some((key_2, _))) => match key_1.cmp(key_2) {
+                Ordering::Less => {
+                    let ret = self.cur_a.take();
+                    self.advance_first();
+                    ret
+                }
+                // Prefer the value from the first iterator as it is assumed to be newer.
+                Ordering::Equal => {
+                    let ret = self.cur_a.take();
+                    self.advance_first();
+                    self.advance_second();
+                    ret
+                }
+                Ordering::Greater => {
+                    let ret = self.cur_b.take();
+                    self.advance_second();
+                    ret
+                }
+            },
         }
     }
 }
@@ -259,10 +310,10 @@ mod tests {
                 Value::Plain(Bytes::from("key_1_value_2"))
             )
         );
-        assert_eq!(
-            *result_iter.next().unwrap(),
-            (Bytes::from("key_2"), Value::Tombstone)
-        );
+        // assert_eq!(
+        //     *result_iter.next().unwrap(),
+        //     (Bytes::from("key_2"), Value::Tombstone)
+        // );
         assert_eq!(
             *result_iter.next().unwrap(),
             (
@@ -307,10 +358,10 @@ mod tests {
         }
         let mut result_iter = result.iter();
 
-        assert_eq!(
-            *result_iter.next().unwrap(),
-            (Bytes::from("key_2"), Value::Tombstone)
-        );
+        // assert_eq!(
+        //     *result_iter.next().unwrap(),
+        //     (Bytes::from("key_2"), Value::Tombstone)
+        // );
         assert_eq!(
             *result_iter.next().unwrap(),
             (
@@ -324,6 +375,81 @@ mod tests {
                 Bytes::from("key_4"),
                 Value::Plain(Bytes::from("key_4_value"))
             )
+        );
+    }
+
+    #[test]
+    fn merge_iter_tombstone_deletes_older_value() {
+        let map_one = build_map_with(vec![("key_1".into(), "key_1_value".into())]); // oldest
+        let map_two = build_map_with(vec![("key_1".into(), "".into())]); // newest
+
+        let iters = vec![map_two, map_one]
+            .into_iter()
+            .map(|m| MemtableIterator::from_map(Arc::new(m)))
+            .collect();
+
+        let iter = MergeIterator::new(iters);
+
+        let result: Vec<_> = iter.collect();
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn merge_iter_produces_no_duplicates() {
+        let map_one = build_map_with(vec![
+            ("key_1".into(), "key_1_value".into()),
+            ("key_2".into(), "key_2_value".into()),
+        ]); // oldest
+        let map_two = build_map_with(vec![("key_1".into(), "newest_value".into())]); // newest
+
+        let iters = vec![map_two, map_one]
+            .into_iter()
+            .map(|m| MemtableIterator::from_map(Arc::new(m)))
+            .collect();
+
+        let iter = MergeIterator::new(iters);
+        let result: Vec<_> = iter.collect();
+
+        assert_eq!(
+            result,
+            vec![
+                (
+                    Bytes::from("key_1"),
+                    Value::Plain(Bytes::from("newest_value"))
+                ),
+                (
+                    Bytes::from("key_2"),
+                    Value::Plain(Bytes::from("key_2_value"))
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_iter_interleaved_with_tombstone() {
+        let map_one = build_map_with(vec![
+            ("key_1".into(), "v1".into()),
+            ("key_2".into(), "v2_old".into()),
+            ("key_3".into(), "v3".into()),
+        ]); // oldest
+        let map_two = build_map_with(vec![("key_2".into(), "v2_new".into())]); // intermediate
+        let map_three = build_map_with(vec![("key_2".into(), "".into())]); //newest
+
+        let iters = vec![map_three, map_two, map_one]
+            .into_iter()
+            .map(|m| MemtableIterator::from_map(Arc::new(m)))
+            .collect();
+
+        let iter = MergeIterator::new(iters);
+        let result: Vec<_> = iter.collect();
+
+        assert_eq!(
+            result,
+            vec![
+                (Bytes::from("key_1"), Value::Plain(Bytes::from("v1"))),
+                (Bytes::from("key_3"), Value::Plain(Bytes::from("v3")))
+            ]
         );
     }
 }

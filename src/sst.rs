@@ -1,32 +1,42 @@
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
+    io::{self, Write},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 use crate::{
+    block::{
+        Block, BlockBuilder, BlockInfo, MetaBlock, iterator::BlockIterError,
+        iterator::BlockIterator,
+    },
     filter::{Filter, bloom::Bloom},
     index::{Index, IndexBuilder},
-    iterator::block::{BlockIterError, BlockIterator},
-    sst::block::{Block, BlockBuilder, MetaBlock},
+    iterator::StorageIter,
     types::Value,
 };
 use bytes::{Buf, BufMut, Bytes};
-use crossbeam_skiplist::map::Iter;
 
 pub(crate) const U16_SIZE: usize = std::mem::size_of::<u16>();
 pub(crate) const U32_SIZE: usize = std::mem::size_of::<u32>();
 pub(crate) const U64_SIZE: usize = std::mem::size_of::<u64>();
 
-pub(crate) const BLOCK_SIZE: usize = 4 * 1024;
 pub(crate) const MAX_TABLE_SIZE: usize = 64 * 1024 * 1024;
 pub(crate) const FOOTER_SIZE: usize = 24;
 
 pub(crate) const SST_FILE_PREFIX: &str = "sst";
 
 pub(crate) mod iterator;
+
+#[derive(Clone, Debug)]
+pub(crate) struct SSTableData {
+    pub(crate) blocks: Vec<Block>,
+    pub(crate) index: Index,
+    pub(crate) meta: MetaBlock,
+    pub(crate) footer: TableFooter,
+}
 
 ///
 /// The on-disk format of an SSTable is as follows:
@@ -36,23 +46,17 @@ pub(crate) mod iterator;
 /// +----------------+----------------+-------+----------------+--------+--------+----------+
 ///
 #[derive(Clone, Debug)]
-pub(crate) struct SSTableData {
-    pub(crate) blocks: Vec<block::Block>,
+pub(crate) struct SSTable {
+    pub(crate) id: usize,
     pub(crate) index: Index,
     pub(crate) meta: MetaBlock,
-    pub(crate) footer: TableFooter,
+    pub(crate) file: Arc<File>,
+    pub(crate) path: PathBuf,
+    pub(crate) size: usize,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct SSTable {
-    id: usize,
-    index: Index,
-    meta: MetaBlock,
-    file: Arc<File>,
-    path: PathBuf,
-    size: usize,
-}
-
+///
+/// Footer including SST information including beginning offsets of index and meta blocks.
 ///
 /// +-------------+----------------+-----------------+-------------+
 /// |     id      |  index_offset  |   meta offset   |    magic    |
@@ -109,11 +113,11 @@ impl TableFooter {
 
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum SSTableError {
-    #[error("Failed to initialize SSTable")]
+    #[error("Failed to create SST file")]
     InitFailed,
     #[error("Unable to flush memtable to SSTable")]
     WriteFailed(#[from] std::io::Error),
-    #[error("Unable to recover SSTable from file")]
+    #[error("Unable to recover SST from file")]
     FailedToOpen,
     #[error("Cannot create an iterator for given block")]
     InvalidBlock,
@@ -149,8 +153,8 @@ impl WriteableSSTable {
         for data_block in data.blocks.iter() {
             size += self.file.write(&data_block.data)?;
 
-            let offsets_len = U16_SIZE * data_block.offsets.len();
-            let mut offset_buf = vec![0; offsets_len];
+            let offsets_len = data_block.offsets_data_size();
+            let mut offset_buf = Vec::with_capacity(offsets_len);
             for offset in data_block.offsets.iter() {
                 offset_buf.put_u16_le(*offset);
             }
@@ -183,17 +187,18 @@ impl SSTableData {
         id: usize,
         block_builder: &mut BlockBuilder,
         index_builder: &mut IndexBuilder,
-        data_dir: PathBuf,
+        path: PathBuf,
     ) -> Result<SSTable, SSTableError> {
         let blocks: Vec<Block> = block_builder.build();
-        let index_start_offset = blocks.iter().map(|b| b.size()).sum::<usize>() as u64;
+        let index_start_offset = blocks.iter().map(|b| b.data_length()).sum::<usize>() as u64;
         let index = index_builder.build(index_start_offset);
         let filter = Bloom::build(block_builder.key_hashes());
 
         let data = match (index.first_key(), index.last_key()) {
             (Some(first), Some(last)) => {
-                let mut block_offsets: Vec<u64> = vec![0];
-                for block in blocks.iter().skip(1) {
+                let mut block_offsets: Vec<u64> = vec![];
+                block_offsets.push(0);
+                for block in blocks.iter() {
                     block_offsets.push(block.size() as u64);
                 }
 
@@ -226,30 +231,40 @@ impl SSTableData {
         };
 
         let mut data = data?;
-        let path = Path::new(&data_dir).join(format!("{}-{}", SST_FILE_PREFIX, id));
         let mut writer = WriteableSSTable::create(&path)?;
 
         let bytes_written = writer.write(&mut data)?;
         let read_only_file = OpenOptions::new().read(true).open(&path)?;
 
-        Ok(SSTable {
-            id,
-            index,
-            meta: data.meta,
-            file: Arc::new(read_only_file),
-            path,
-            size: bytes_written,
-        })
+        eprintln!("{} bytes written to file {:?}", bytes_written, &path);
+        let sst = SSTable::open(id, &path, Arc::new(read_only_file))?;
+
+        Ok(sst)
     }
 }
 
-pub(crate) struct BlockInfo {
-    block_idx: usize,
-    block_offset: u64,
-    block_size: u64,
-}
-
 impl SSTable {
+    pub(crate) fn id(&self) -> usize {
+        self.id
+    }
+
+    pub(crate) fn table_size(&self) -> usize {
+        self.size
+    }
+
+    pub(crate) fn first_key(&self) -> &[u8] {
+        &self.meta.first_key
+    }
+
+    pub(crate) fn last_key(&self) -> &[u8] {
+        &self.meta.last_key
+    }
+
+    pub(crate) fn created_at(&self) -> io::Result<SystemTime> {
+        let metadata = self.file.metadata()?;
+        metadata.created()
+    }
+
     pub(crate) fn open(id: usize, path: &Path, file: Arc<File>) -> Result<Self, SSTableError> {
         let size: u64 = match file.metadata() {
             Ok(metadata) => metadata.len(),
@@ -258,6 +273,7 @@ impl SSTable {
             }
         };
 
+        eprintln!("SST File {} - size: {}", path.display(), size);
         let footer_offset = size - FOOTER_SIZE as u64;
         let raw_footer_data = Self::read_at(&file, FOOTER_SIZE, footer_offset)?;
         let footer = TableFooter::decode(&raw_footer_data);
@@ -300,10 +316,22 @@ impl SSTable {
             let pair = Block::decode_pair(&raw_block, key_offset as usize);
             assert_eq!(key, pair.0);
 
+            if pair.1.is_empty() {
+                return Err(SSTableError::NonexistentKey);
+            }
+
             Ok(Bytes::copy_from_slice(pair.1))
         } else {
             Err(SSTableError::InitFailed)
         }
+    }
+
+    pub(crate) fn contains(&self, key: &Bytes) -> bool {
+        &self.meta.first_key <= key && key <= &self.meta.last_key
+    }
+
+    pub(crate) fn precedes_range(&self, key: &Bytes) -> bool {
+        key < &self.meta.first_key
     }
 
     pub(crate) fn find_block_by_key(&self, key: &Bytes) -> Result<BlockInfo, SSTableError> {
@@ -318,17 +346,31 @@ impl SSTable {
                 .find(|&&offset| offset == block_offset)
             {
                 Some(idx) => *idx as usize,
-                None => return Err(SSTableError::InvalidBlock),
+                None => {
+                    eprintln!("Unable to find block idx from offset");
+                    return Err(SSTableError::InvalidBlock);
+                }
             };
 
-            Ok(BlockInfo {
-                block_idx,
-                block_offset,
-                block_size,
-            })
+            Ok(BlockInfo::new(block_idx, block_offset, block_size))
         } else {
+            eprintln!("Key {:?} doesn't exist in table: {}", key, self.id);
             Err(SSTableError::NonexistentKey)
         }
+    }
+
+    pub(crate) fn find_block_for_seek(&self, key: &[u8]) -> Result<BlockInfo, SSTableError> {
+        let (idx_entry, block_size) = self.index.seek(key).ok_or(SSTableError::NonexistentKey)?;
+
+        let block_offset = idx_entry.block_offset();
+        let block_idx = self
+            .meta
+            .block_offsets
+            .iter()
+            .position(|&offset| offset == block_offset)
+            .ok_or(SSTableError::InvalidBlock)?;
+
+        Ok(BlockInfo::new(block_idx, block_offset, block_size))
     }
 
     pub(crate) fn block_iter(&self, block_idx: usize) -> Result<BlockIterator, SSTableError> {
@@ -351,14 +393,10 @@ impl SSTable {
         let num_entries = *self.meta.count_per_blk.get(block_idx).unwrap();
         let offset_data_size: usize = U16_SIZE * (num_entries as usize);
         let offset_data_start = next_offset - offset_data_size as u64;
+        let block_info = BlockInfo::new(block_idx, block_start, block_size as u64);
 
-        let block = self.load_block(
-            block_size,
-            block_start,
-            block_idx,
-            offset_data_start as usize,
-            num_entries as usize,
-        )?;
+        let block =
+            self.load_block(block_info, offset_data_start as usize, num_entries as usize)?;
 
         match BlockIterator::new(Arc::new(block)) {
             Ok(iter) => Ok(iter),
@@ -368,18 +406,13 @@ impl SSTable {
 
     pub(crate) fn block_iter_by_offset(
         &self,
-        info: BlockInfo,
+        block_info: BlockInfo,
     ) -> Result<BlockIterator, SSTableError> {
-        let num_entries = *self.meta.count_per_blk.get(info.block_idx).unwrap();
-        let offset_data_start = info.block_offset + info.block_size;
+        let num_entries = *self.meta.count_per_blk.get(block_info.idx()).unwrap();
+        let offset_data_size: usize = U16_SIZE * num_entries as usize;
+        let offset_data_start: usize = (block_info.size() as usize) - offset_data_size;
 
-        let block = self.load_block(
-            info.block_size as usize,
-            info.block_offset,
-            info.block_idx,
-            offset_data_start as usize,
-            num_entries as usize,
-        )?;
+        let block = self.load_block(block_info, offset_data_start, num_entries as usize)?;
 
         match BlockIterator::new(Arc::new(block)) {
             Ok(iter) => Ok(iter),
@@ -389,36 +422,41 @@ impl SSTable {
 
     fn load_block(
         &self,
-        block_size: usize,
-        block_offset: u64,
-        block_idx: usize,
+        block_info: BlockInfo,
         offset_data_start: usize,
         num_entries: usize,
     ) -> Result<Block, SSTableError> {
-        let mut raw_block = Self::read_at(&self.file, block_size, block_offset)?;
+        let mut raw_block =
+            Self::read_at(&self.file, block_info.size() as usize, block_info.offset())?;
         Ok(Block::decode_full(
             &mut raw_block,
-            block_idx,
-            offset_data_start as usize,
-            num_entries as usize,
+            block_info.idx(),
+            offset_data_start,
+            num_entries,
         ))
     }
 }
 
 pub(crate) fn build_sstable(
     memtable_id: usize,
-    memtable_iter: Iter<'_, Bytes, Value>,
+    iter: impl StorageIter<KeyVal = (Bytes, Value)>,
     block_size: usize,
-    data_dir: PathBuf,
+    path: PathBuf,
+    skip_empty_values: bool,
 ) -> Result<SSTable, SSTableError> {
     let mut block_builder = BlockBuilder::init(1, block_size);
     let mut index_builder = IndexBuilder::builder();
-    memtable_iter.for_each(|entry| {
-        let key = entry.key().to_vec();
-        let value = match entry.value() {
+
+    iter.for_each(|pair| {
+        let key = pair.0.to_vec();
+        let value = match pair.1 {
             Value::Plain(v) => v.to_vec(),
             Value::Tombstone => vec![],
         };
+
+        if value.is_empty() && skip_empty_values {
+            return;
+        }
 
         block_builder.encode_pair(&key, &value);
         let block_offset = block_builder.latest_block_offset();
@@ -427,274 +465,7 @@ pub(crate) fn build_sstable(
         }
     });
 
-    SSTableData::init(
-        memtable_id,
-        &mut block_builder,
-        &mut index_builder,
-        data_dir,
-    )
-}
-
-type RawPair<'a> = (&'a [u8], &'a [u8]);
-
-pub(crate) mod block {
-    use super::BufMut;
-    use super::U16_SIZE;
-    use crate::filter::Filter;
-    use crate::filter::bloom::Bloom;
-    use crate::sst::RawPair;
-    use crate::sst::U32_SIZE;
-    use crate::sst::U64_SIZE;
-    use bytes::Buf;
-    use std::vec;
-
-    #[derive(Debug, Clone)]
-    pub(crate) struct Block {
-        pub(crate) id: usize,
-        pub(crate) data: Vec<u8>,
-        pub(crate) offsets: Vec<u16>,
-        pub(crate) num_entries: u16,
-    }
-
-    impl Block {
-        pub(crate) fn size(&self) -> usize {
-            self.data.len()
-        }
-
-        pub(crate) fn first_key(&self) -> Vec<u8> {
-            let mut buf = &self.data[..];
-            let key_len = buf.get_u16_le() as usize;
-            let key = buf[..key_len].to_vec();
-            buf.advance(key_len);
-
-            key
-        }
-
-        pub(crate) fn decode_at(&'_ self, offset: &u16) -> Result<RawPair<'_>, DecodingError> {
-            let offset = *offset as usize;
-            if offset >= self.data.len() {
-                return Err(DecodingError::InaccessibleOffset);
-            }
-
-            let pair = Self::decode_pair(&self.data, offset);
-            Ok(pair)
-        }
-
-        pub(crate) fn decode_full(
-            buf: &mut [u8],
-            block_idx: usize,
-            offset_data_start: usize,
-            num_entries: usize,
-        ) -> Self {
-            let data = buf[..offset_data_start].to_vec();
-
-            let mut offsets: Vec<u16> = Vec::with_capacity(num_entries);
-            let mut buf = &buf[offset_data_start..];
-            for _ in 0..num_entries {
-                offsets.push(buf.get_u16_le());
-            }
-
-            Self {
-                id: block_idx,
-                data,
-                offsets,
-                num_entries: num_entries as u16,
-            }
-        }
-
-        pub(crate) fn decode_pair(buf: &'_ [u8], offset: usize) -> RawPair<'_> {
-            let mut buf = &buf[offset..];
-
-            let key_len = buf.get_u16_le() as usize;
-            let key = &buf[..key_len];
-            buf.advance(key_len);
-
-            let val_len = buf.get_u16_le() as usize;
-            let val = &buf[..val_len];
-            buf.advance(val_len);
-
-            (key, val)
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    pub(crate) struct MetaBlock {
-        pub(super) filter: Bloom,
-        pub(super) first_key: Vec<u8>,
-        pub(super) last_key: Vec<u8>,
-        pub(super) num_blks: u16,
-        pub(super) count_per_blk: Vec<u16>,
-        pub(super) block_offsets: Vec<u64>,
-    }
-
-    impl MetaBlock {
-        pub(super) fn encode(&self, buf: &mut Vec<u8>) -> bool {
-            self.filter.encode(buf);
-            let key_len = self.first_key.len() as u16;
-            buf.put_u16_le(key_len);
-            buf.put(self.first_key.as_ref());
-
-            let key_len = self.last_key.len() as u16;
-            buf.put_u16_le(key_len);
-            buf.put(self.last_key.as_ref());
-
-            buf.put_u16_le(self.num_blks);
-
-            let len = self.count_per_blk.len() as u32;
-            buf.put_u32_le(len);
-            for count in self.count_per_blk.iter() {
-                buf.put_u16_le(*count);
-            }
-
-            let len = self.block_offsets.len() as u32;
-            buf.put_u32_le(len);
-            for offset in self.block_offsets.iter() {
-                buf.put_u64_le(*offset);
-            }
-
-            true
-        }
-
-        pub(super) fn decode(mut buf: &[u8]) -> Self {
-            let filter = Bloom::decode(buf);
-            buf.advance(filter.size());
-
-            let key_len = buf.get_u16_le() as usize;
-            let first_key = buf[..key_len].to_vec();
-            buf.advance(key_len);
-
-            let key_len = buf.get_u16_le() as usize;
-            let last_key = buf[..key_len].to_vec();
-            buf.advance(key_len);
-
-            let num_blocks = buf.get_u16_le();
-
-            let len = buf.get_u32_le();
-            let mut count_per_block = Vec::with_capacity(len as usize);
-            for _ in 0..len {
-                count_per_block.push(buf.get_u16_le());
-            }
-
-            let len = buf.get_u32_le();
-            let mut block_offset = Vec::with_capacity(len as usize);
-            for _ in 0..len {
-                block_offset.push(buf.get_u64_le());
-            }
-
-            Self {
-                filter,
-                first_key,
-                last_key,
-                num_blks: num_blocks,
-                count_per_blk: count_per_block,
-                block_offsets: block_offset,
-            }
-        }
-
-        pub(super) fn size(&self) -> usize {
-            let sizes = [
-                self.filter.size(),
-                (self.first_key.len() + U16_SIZE),
-                (self.last_key.len() + U16_SIZE),
-                U16_SIZE,
-                ((self.count_per_blk.len() * U16_SIZE) + U32_SIZE),
-                ((self.block_offsets.len() * U64_SIZE) + U32_SIZE),
-            ];
-            sizes.iter().sum()
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    pub(crate) struct BlockBuilder {
-        num: usize,
-        blocks: Vec<Block>,
-        cur_block_offset: u64,
-        cur_block_data: Vec<u8>,
-        offsets: Vec<u16>,
-        key_hashes: Vec<u64>,
-        max_block_size: usize,
-    }
-
-    #[derive(thiserror::Error, Debug, PartialEq)]
-    pub(crate) enum DecodingError {
-        #[error("Invalid offset for this block")]
-        InaccessibleOffset,
-    }
-
-    impl BlockBuilder {
-        pub(crate) fn init(block_num: usize, block_size: usize) -> Self {
-            BlockBuilder {
-                num: block_num,
-                blocks: vec![],
-                cur_block_offset: 0,
-                cur_block_data: vec![],
-                offsets: vec![],
-                key_hashes: vec![],
-                max_block_size: block_size,
-            }
-        }
-
-        pub(crate) fn latest_block_offset(&self) -> u64 {
-            self.cur_block_offset
-        }
-
-        pub(crate) fn latest_key_offset(&self) -> Option<u16> {
-            self.offsets.last().copied()
-        }
-
-        pub(crate) fn encode_pair(&mut self, key: &[u8], value: &[u8]) -> usize {
-            let key_len = key.len();
-            let value_len = value.len();
-            let encoded_size = key_len + value_len + (U16_SIZE * 2);
-
-            if self.cur_block_data.len() + encoded_size >= self.max_block_size {
-                let block = Block {
-                    id: self.num,
-                    data: self.cur_block_data.clone(),
-                    offsets: self.offsets.clone(),
-                    num_entries: self.offsets.len() as u16,
-                };
-                self.cur_block_offset += block.size() as u64;
-                self.blocks.push(block);
-                self.num += 1;
-                self.clear();
-            }
-            self.offsets.push(self.cur_block_data.len() as u16);
-
-            self.cur_block_data.put_u16_le(key_len as u16);
-            self.cur_block_data.put(key);
-            self.cur_block_data.put_u16_le(value_len as u16);
-            self.cur_block_data.put(value);
-
-            self.key_hashes.push(seahash::hash(key));
-
-            encoded_size
-        }
-
-        pub(crate) fn build(&mut self) -> Vec<Block> {
-            if !self.cur_block_data.is_empty() {
-                let block = Block {
-                    id: self.num,
-                    data: self.cur_block_data.clone(),
-                    offsets: self.offsets.clone(),
-                    num_entries: self.offsets.len() as u16,
-                };
-                self.blocks.push(block);
-            }
-
-            self.blocks.clone()
-        }
-
-        pub(crate) fn key_hashes(&self) -> &[u64] {
-            &self.key_hashes
-        }
-
-        fn clear(&mut self) {
-            self.cur_block_data.clear();
-            self.offsets.clear();
-            self.key_hashes.clear();
-        }
-    }
+    SSTableData::init(memtable_id, &mut block_builder, &mut index_builder, path)
 }
 
 #[cfg(test)]
@@ -702,96 +473,11 @@ mod tests {
     use std::{fs::OpenOptions, path::PathBuf, sync::Arc};
 
     use crate::{
-        memtable::{Buffer, Memtable},
-        sst::{
-            SST_FILE_PREFIX, SSTable,
-            block::{BlockBuilder, DecodingError},
-            build_sstable,
-        },
+        memtable::{Buffer, Memtable, MemtableIterator},
+        sst::{SSTable, build_sstable},
     };
-    use bytes::{BufMut, Bytes};
-    use pretty_assertions::assert_eq;
+    use bytes::Bytes;
     use temp_dir::TempDir;
-
-    #[test]
-    fn block_builder_encodes_pair() {
-        let mut builder = BlockBuilder::init(1, 4 * 1024);
-        let k1 = "key_1".as_bytes();
-        let v1 = "value_1".as_bytes();
-        let k2 = "key_2".as_bytes();
-        let v2 = "value_2".as_bytes();
-        // Two 2 byte length values + 5 bytes of key_1 + 7 bytes of value_1 = 16
-        let expected_offsets: Vec<u16> = vec![0, 16];
-
-        builder.encode_pair(k1, v1);
-        builder.encode_pair(k2, v2);
-        let blocks = builder.build();
-
-        let mut expected_data = Vec::new();
-        expected_data.put_u16_le(k1.len() as u16);
-        expected_data.put(k1);
-        expected_data.put_u16_le(v1.len() as u16);
-        expected_data.put(v1);
-        expected_data.put_u16_le(k2.len() as u16);
-        expected_data.put(k2);
-        expected_data.put_u16_le(v2.len() as u16);
-        expected_data.put(v2);
-
-        assert!(!blocks.is_empty());
-        let block = blocks.first().unwrap();
-
-        assert!(!block.data.is_empty());
-        assert_eq!(block.data, expected_data);
-        assert_eq!(block.offsets, expected_offsets);
-
-        assert_eq!(block.first_key(), "key_1".as_bytes());
-    }
-
-    #[test]
-    fn block_decode_returns_key_value_pair() {
-        let mut builder = BlockBuilder::init(1, 4 * 1024);
-        let k1 = "key_1".as_bytes();
-        let v1 = "value_1".as_bytes();
-        let k2 = "key_2".as_bytes();
-        let v2 = "value_2".as_bytes();
-
-        builder.encode_pair(k1, v1);
-        builder.encode_pair(k2, v2);
-        let blocks = builder.build();
-        let block = blocks.first().unwrap();
-
-        let offset = block.offsets.first().unwrap();
-        let first_result = block.decode_at(offset).unwrap();
-        let offset = block.offsets.last().unwrap();
-        let second_result = block.decode_at(offset).unwrap();
-
-        assert_eq!(first_result.0, k1);
-        assert_eq!(first_result.1, v1);
-
-        assert_eq!(second_result.0, k2);
-        assert_eq!(second_result.1, v2);
-    }
-
-    #[test]
-    fn block_decode_returns_err_for_invalid_offset() {
-        let mut builder = BlockBuilder::init(1, 4 * 1024);
-        let k1 = "key_1".as_bytes();
-        let v1 = "value_1".as_bytes();
-        let k2 = "key_2".as_bytes();
-        let v2 = "value_2".as_bytes();
-
-        builder.encode_pair(k1, v1);
-        builder.encode_pair(k2, v2);
-        let blocks = builder.build();
-        let block = blocks.first().unwrap();
-
-        let offset = u16::MAX;
-        let actual = block.decode_at(&offset);
-
-        assert!(actual.is_err());
-        let err = actual.unwrap_err();
-        assert_eq!(err, DecodingError::InaccessibleOffset);
-    }
 
     fn test_memtable(path: PathBuf) -> Memtable {
         let options = crate::memtable::TableOptions {
@@ -800,6 +486,7 @@ mod tests {
         };
         Memtable::create(1, Some(options))
     }
+
     #[test]
     fn build_sstable_from_memtable_contents() {
         let tempdir = TempDir::new().unwrap();
@@ -822,15 +509,21 @@ mod tests {
         let _ = table.put(&k3, &v3);
         let _ = table.put(&k4, &v4);
 
-        let datadir = tempdir.path();
-        let result = build_sstable(1, table.store.iter(), 32, datadir.to_path_buf());
+        let sst_path = path.join("sst-file.sst");
+        let result = build_sstable(
+            1,
+            MemtableIterator::from_map(table.store.clone()),
+            32,
+            sst_path,
+            false,
+        );
         assert!(result.is_ok());
 
         let sst = result.unwrap();
 
         assert!(sst.size > 0);
 
-        let expected_path = path.join(format!("{}-{}", SST_FILE_PREFIX, table.id.clone()));
+        let expected_path = path.join("sst-file.sst");
         let file = OpenOptions::new().read(true).open(&expected_path);
 
         assert!(file.is_ok());
@@ -858,11 +551,15 @@ mod tests {
         let _ = table.put(&k2, &v2);
         let _ = table.put(&k3, &v3);
 
-        let result = table.flush();
+        let result = table.flush(path.join(format!("sst-file.sst")));
         assert!(result.is_ok());
+
+        let unknown_key = Bytes::from("4");
 
         let sst = result.unwrap();
         assert!(sst.size > 0);
         assert!(sst.probe(&k1));
+        assert!(sst.contains(&k2));
+        assert!(!sst.contains(&unknown_key));
     }
 }

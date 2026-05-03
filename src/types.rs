@@ -7,3 +7,12 @@ pub(crate) enum Value {
 }
 
 pub(crate) type Pair = (Bytes, Value);
+
+impl Value {
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Value::Plain(bytes) => bytes.is_empty(),
+            Value::Tombstone => true,
+        }
+    }
+}

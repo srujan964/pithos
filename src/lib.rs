@@ -1,4 +1,6 @@
 pub mod api;
+mod block;
+mod compaction;
 mod core;
 mod filter;
 mod index;

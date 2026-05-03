@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::{iterator::StorageIter, sst::block::Block, types::Pair, types::Value};
+use crate::{block::Block, iterator::StorageIter, types::Pair, types::Value};
 
 #[derive(Debug)]
 pub(crate) struct BlockIterator {
@@ -22,7 +22,6 @@ pub(crate) enum BlockIterError {
 
 impl BlockIterator {
     pub(crate) fn new(block: Arc<Block>) -> Result<Self, BlockIterError> {
-        let block = block.clone();
         if block.data.is_empty() || block.offsets.is_empty() {
             return Err(BlockIterError::EmptyBlock);
         }
@@ -75,7 +74,6 @@ impl Iterator for BlockIterator {
         }
 
         let offset = self.block.offsets[self.idx];
-
         let pair = self
             .block
             .decode_at(&offset)
@@ -105,10 +103,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::{
-        iterator::block::BlockIterator,
-        sst::block::{Block, BlockBuilder},
-        types::Pair,
-        types::Value,
+        block::{Block, BlockBuilder, iterator::BlockIterator},
+        types::{Pair, Value},
     };
 
     fn build_block() -> Vec<Block> {

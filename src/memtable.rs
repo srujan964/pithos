@@ -1,3 +1,4 @@
+use crate::block;
 use crate::iterator::StorageIter;
 use crate::sst::{self, SSTable};
 use crate::types::Value;
@@ -87,7 +88,7 @@ pub(crate) trait Buffer {
 
     fn scan(&self, start: Bound<Bytes>, end: Bound<Bytes>) -> MemtableIterator;
 
-    fn flush(&self) -> Result<SSTable, MemError>;
+    fn flush(&self, path: PathBuf) -> Result<SSTable, MemError>;
 }
 
 impl Buffer for Memtable {
@@ -148,14 +149,11 @@ impl Buffer for Memtable {
         MemtableIterator::range(self.store.clone(), start, end)
     }
 
-    fn flush(&self) -> Result<SSTable, MemError> {
-        sst::build_sstable(
-            self.id,
-            self.store.iter(),
-            sst::BLOCK_SIZE,
-            self.options.data_dir.clone(),
-        )
-        .map_err(|_| MemError::FreezeFailure)
+    fn flush(&self, path: PathBuf) -> Result<SSTable, MemError> {
+        let iter = MemtableIterator::from_map(self.store.clone());
+
+        sst::build_sstable(self.id, iter, block::BLOCK_SIZE, path, false)
+            .map_err(|_| MemError::FreezeFailure)
     }
 }
 

@@ -2,6 +2,9 @@ use bytes::{Buf, BufMut};
 
 use crate::sst;
 
+///
+/// Key index with an offset to the block it lives in, and the offset within that block.
+///
 #[derive(Debug, Clone)]
 pub(crate) struct IndexEntry {
     key: Vec<u8>,
@@ -9,6 +12,8 @@ pub(crate) struct IndexEntry {
     key_offset: u16,
 }
 
+///
+/// Indexes each key in the SST.
 ///
 /// +---------------------+-------+--------------------------+--------------------+
 /// |  key_len (2 bytes)  |  key  |  block_offset (8 bytes)  |  offset (2 bytes)  |
@@ -18,7 +23,7 @@ pub(crate) struct IndexEntry {
 pub(crate) struct Index {
     pub(crate) start: u64,
     pub(crate) blocks: Vec<IndexEntry>,
-    size: usize,
+    pub(crate) size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -77,19 +82,45 @@ impl Index {
     pub(crate) fn find_idx_entry_by_key(&self, key: &[u8]) -> Option<(&IndexEntry, u64)> {
         let entry_idx = match self
             .blocks
-            .binary_search_by_key(&key.to_vec(), |entry| entry.key.clone())
+            .binary_search_by_key(&key, |entry| entry.key.as_ref())
         {
             Ok(idx) => idx,
             Err(_) => return None,
         };
 
         let entry = &self.blocks[entry_idx];
+
+        // Calculate block size by finding the next block and using its starting offset
+        // or it's the final block and use the index start instead.
         let block_size = self.blocks[entry_idx..]
             .iter()
             .find(|other| other.block_offset > entry.block_offset)
             .map(|other| other.block_offset - entry.block_offset)
             .unwrap_or_else(|| self.start - entry.block_offset);
 
+        Some((entry, block_size))
+    }
+
+    pub(crate) fn seek(&self, key: &[u8]) -> Option<(&IndexEntry, u64)> {
+        let idx = self.blocks.partition_point(|e| e.key.as_slice() < key);
+        if idx == self.blocks.len() {
+            return None;
+        }
+        // If the previous entry shares the same block, start there so that we don't skip
+        // pairs that fall between two indexed keys within the same block.
+        let start = if idx > 0 && self.blocks[idx - 1].block_offset == self.blocks[idx].block_offset
+        {
+            idx - 1
+        } else {
+            idx
+        };
+
+        let entry = &self.blocks[start];
+        let block_size = self.blocks[start..]
+            .iter()
+            .find(|e| e.block_offset > entry.block_offset)
+            .map(|other| other.block_offset - entry.block_offset)
+            .unwrap_or(self.start - entry.block_offset);
         Some((entry, block_size))
     }
 
