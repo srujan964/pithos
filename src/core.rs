@@ -5,14 +5,15 @@ use crate::manifest::{MANIFEST_FILE, Manifest, ManifestRecord};
 use crate::memtable::{self, Buffer, MemtableIterator, TableOptions};
 use crate::sst::iterator::{ConcatenatingIterator, SSTableIterator};
 use crate::sst::{SST_FILE_PREFIX, SSTable, SSTableError};
+use crate::wal;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 
 use std::any::Any;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::Debug;
-use std::fs::{File, OpenOptions, create_dir};
+use std::fs::{File, OpenOptions};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -214,15 +215,20 @@ where
             (create_fresh_manifest(&options.data_dir), vec![])
         };
 
-        // Get the latest memtable ID from the manifest first.
+        // Find the highest memtable ID from manifest records first.
+        // Keep track of memtable IDs that have a NewMemtable but no Flush - their WAL data
+        // needs to be recovered.
         let mut memtable_id = 0usize;
+        let mut unflushed: BTreeSet<usize> = BTreeSet::new();
         for record in &records {
             match record {
                 ManifestRecord::Flush(sst_id) => {
                     memtable_id = memtable_id.max(*sst_id);
+                    unflushed.remove(sst_id);
                 }
                 ManifestRecord::NewMemtable(id) => {
                     memtable_id = memtable_id.max(*id);
+                    unflushed.insert(*id);
                 }
                 ManifestRecord::CompactionResult(_, output) => {
                     memtable_id = memtable_id.max(*output.iter().max().unwrap_or(&0));
@@ -232,6 +238,24 @@ where
 
         let new_memtable_id = memtable_id + 1;
         let memtable = B::create(new_memtable_id, Some(table_options));
+
+        // Replay all unflushed WAL into current memtable. This should also write to current
+        // memtable's WAL so that the recovered data can survive another crash.
+        let wal_base = options.data_dir.join(memtable::WAL_DIR);
+        for id in &unflushed {
+            let wal_dir = wal_base.join(id.to_string());
+            for op in wal::read_ops(&wal_dir) {
+                match op {
+                    wal::Op::Put(key, val) => {
+                        let _ = memtable.put(&Bytes::from(key), &Bytes::from(val));
+                    }
+                    wal::Op::Delete(key) => {
+                        let _ = memtable.delete(&Bytes::from(key));
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&wal_dir);
+        }
 
         let mut state = State {
             memtable: Arc::new(memtable),
@@ -1010,5 +1034,40 @@ mod tests {
                 Value::Plain(scanning_value_3.clone())
             )
         );
+    }
+
+    #[test]
+    fn wal_recovery_restores_unflushed_writes_after_simulated_crash() {
+        let tempdir = TempDir::new().unwrap();
+        let data_dir = tempdir.path().to_path_buf();
+
+        let key_a = Bytes::from("alpha");
+        let key_b = Bytes::from("beta");
+        let val_a = Bytes::from("value_a");
+        let val_b = Bytes::from("value_b");
+
+        // "Crash" session: write two keys, never close.
+        {
+            let storage = CoreStorageInner::<crate::memtable::Memtable>::open(Some(CoreOptions {
+                data_dir: data_dir.clone(),
+                max_memtable_size: memtable::MAX_TABLE_SIZE,
+                memtable_limit: 3,
+                compaction_opts: CompactionOptions::default(),
+            }));
+            storage.put(key_a.clone(), val_a.clone()).unwrap();
+            storage.put(key_b.clone(), val_b.clone()).unwrap();
+            // drop without close — WAL is flushed by BufWriter's Drop, but no SST is written
+        }
+
+        // Recovery session: open again, data should be visible via WAL replay.
+        let storage = CoreStorageInner::<crate::memtable::Memtable>::open(Some(CoreOptions {
+            data_dir: data_dir.clone(),
+            max_memtable_size: memtable::MAX_TABLE_SIZE,
+            memtable_limit: 3,
+            compaction_opts: CompactionOptions::default(),
+        }));
+
+        assert_eq!(storage.get(key_a).unwrap(), val_a);
+        assert_eq!(storage.get(key_b).unwrap(), val_b);
     }
 }

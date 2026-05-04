@@ -1,7 +1,7 @@
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -118,6 +118,79 @@ impl WalWriter {
     }
 }
 
+/// Recover all operations from a WAL directory.
+///
+/// Stops at a checksum mismatch or an incomplete entry which is possible around crashes.
+pub(crate) fn read_ops(wal_dir: &Path) -> Vec<Op> {
+    let path = wal_dir.join(format!("{WAL_FILE_PREFIX}{:0>5}{WAL_FILE_EXT}", 1));
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(_) => return vec![],
+    };
+
+    let mut ops = Vec::new();
+    let mut buf: &[u8] = &data;
+
+    while buf.remaining() >= 6 {
+        let _version = buf.get_u8();
+        let stored_crc = buf.get_u32_le();
+        let op_type = buf.get_u8();
+
+        let op = match op_type {
+            0 => {
+                if buf.remaining() < 2 {
+                    break;
+                }
+                let key_len = buf.get_u16_le() as usize;
+                if buf.remaining() < key_len + 2 {
+                    break;
+                }
+                let key = buf[..key_len].to_vec();
+                buf.advance(key_len);
+                let val_len = buf.get_u16_le() as usize;
+                if buf.remaining() < val_len {
+                    break;
+                }
+                let val = buf[..val_len].to_vec();
+                buf.advance(val_len);
+
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&[op_type]);
+                hasher.update(&key);
+                hasher.update(&val);
+                if hasher.finalize() != stored_crc {
+                    break;
+                }
+                Op::Put(key, val)
+            }
+            1 => {
+                if buf.remaining() < 2 {
+                    break;
+                }
+                let key_len = buf.get_u16_le() as usize;
+                if buf.remaining() < key_len {
+                    break;
+                }
+                let key = buf[..key_len].to_vec();
+                buf.advance(key_len);
+
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&[op_type]);
+                hasher.update(&key);
+                if hasher.finalize() != stored_crc {
+                    break;
+                }
+                Op::Delete(key)
+            }
+            _ => break,
+        };
+
+        ops.push(op);
+    }
+
+    ops
+}
+
 fn encode(version: WalVersion, crc: u32, op: &Op) -> Vec<u8> {
     let mut buf: Vec<u8> = vec![];
 
@@ -226,6 +299,47 @@ mod tests {
         buf.advance(key_len);
 
         assert!(buf.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn read_ops_roundtrips_put_and_delete() -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path().to_path_buf();
+
+        let writer = WalWriter::open(&path)?;
+        writer.write(&Op::Put(b"hello".to_vec(), b"world".to_vec()))?;
+        writer.write(&Op::Delete(b"hello".to_vec()))?;
+        writer.write(&Op::Put(b"foo".to_vec(), b"bar".to_vec()))?;
+        writer.flush()?;
+
+        let ops = read_ops(&path);
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0], Op::Put(b"hello".to_vec(), b"world".to_vec()));
+        assert_eq!(ops[1], Op::Delete(b"hello".to_vec()));
+        assert_eq!(ops[2], Op::Put(b"foo".to_vec(), b"bar".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn read_ops_stops_at_truncated_entry() -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path().to_path_buf();
+
+        let writer = WalWriter::open(&path)?;
+        writer.write(&Op::Put(b"a".to_vec(), b"1".to_vec()))?;
+        writer.write(&Op::Put(b"b".to_vec(), b"2".to_vec()))?;
+        writer.flush()?;
+
+        // Truncate the file mid-second-entry to simulate a crash during write.
+        let seg = path.join("wal-00001.log");
+        let full_len = std::fs::metadata(&seg)?.len();
+        let file = std::fs::OpenOptions::new().write(true).open(&seg)?;
+        file.set_len(full_len - 3)?;
+
+        let ops = read_ops(&path);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0], Op::Put(b"a".to_vec(), b"1".to_vec()));
         Ok(())
     }
 }

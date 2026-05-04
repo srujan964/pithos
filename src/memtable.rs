@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const WAL_DIR: &str = "wal";
+pub(crate) const WAL_DIR: &str = "wal";
 pub(crate) const MAX_TABLE_SIZE: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
