@@ -3,7 +3,7 @@ use crate::iterator::CombinedIterator;
 use crate::iterator::merge_iterator::{MergeIterator, MultiMergeIterator};
 use crate::manifest::{MANIFEST_FILE, Manifest, ManifestRecord};
 use crate::memtable::{self, Buffer, MemtableIterator, TableOptions};
-use crate::sst::iterator::{ConcatenatingIterator, SSTableIterator};
+use crate::sst::iterator::{ConcatenatingIterator, SSTableIterError, SSTableIterator};
 use crate::sst::{SST_FILE_PREFIX, SSTable, SSTableError};
 use crate::wal;
 
@@ -192,8 +192,10 @@ pub(crate) enum OrchestrationError {
     NothingToFlush,
     #[error("Failed to create SSTable")]
     FlushFailure,
-    #[error("Compaction failed")]
-    CompactionFailure,
+    #[error("Failed to build SST during compaction")]
+    CompactionFailedToBuildSST,
+    #[error("Compaction failed: {0}")]
+    CompactionFailure(#[from] SSTableIterError),
     #[error("Error closing thread")]
     CloseError(Box<dyn Any + Send + 'static>),
 }
@@ -629,7 +631,7 @@ where
         for sst_id in state
             .level_zero
             .iter()
-            .chain(state.levels.iter().flat_map(|(l, ids)| ids))
+            .chain(state.levels.iter().flat_map(|(_, ids)| ids))
         {
             let id = *sst_id;
             let filepath = Self::sst_path(&options.data_dir, id);

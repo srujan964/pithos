@@ -85,9 +85,6 @@ impl Manifest {
             records.push(record);
         }
 
-        // Truncate file after recovering.
-        file.set_len(0)?;
-
         Ok((
             Self {
                 file: Arc::new(Mutex::new(BufWriter::new(file))),

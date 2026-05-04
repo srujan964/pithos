@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -11,13 +11,13 @@ use crate::{
     block,
     compaction::level::LeveledCompactionOptions,
     core::{CoreStorageInner, OrchestrationError, State},
-    iterator::{StorageIter, merge_iterator::MultiMergeIterator},
+    iterator::{StorageIter, merge_iterator::{MergeIterator, MultiMergeIterator}},
     memtable::Buffer,
-    sst::{self, SSTable, iterator::ConcatenatingIterator},
+    sst::{self, SSTable, iterator::{ConcatenatingIterator, SSTableIterator}},
     types::Value,
 };
 
-pub(crate) mod level;
+pub mod level;
 
 #[derive(Clone, Debug)]
 pub enum CompactionOptions {
@@ -146,7 +146,7 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorageInner<B> {
             Ok(sst) => Arc::new(sst),
             Err(e) => {
                 eprintln!("Error buildling SST: {:?}", e);
-                return Err(OrchestrationError::CompactionFailure);
+                return Err(OrchestrationError::CompactionFailedToBuildSST);
             }
         };
 
@@ -176,16 +176,36 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorageInner<B> {
 
         let compact_to_bottom = task.next_level == opts.max_levels;
 
+        if task.input_level.is_none() {
+            // L0 SSTs can overlap: use a heap-based merge iterator.
+            // files_to_compact preserves level_zero order (newest-first), so iter_idx=0 wins
+            // on duplicate keys, which gives the correct newest-value semantics.
+            let iters: VecDeque<SSTableIterator> = upper_ssts
+                .iter()
+                .map(|sst| SSTableIterator::new(sst.clone()))
+                .collect();
+            let upper_iter = MergeIterator::new(iters);
+
+            if lower_ssts.is_empty() {
+                return self.compact_and_build_sst(upper_iter, compact_to_bottom);
+            }
+
+            let lower_iter = ConcatenatingIterator::new_and_seek_to_first(lower_ssts)
+                .map_err(|e| OrchestrationError::CompactionFailure(e))?;
+            let iter = MultiMergeIterator::new(upper_iter, lower_iter);
+            return self.compact_and_build_sst(iter, compact_to_bottom);
+        }
+
+        // L1+ SSTs within a level are non-overlapping: concatenating iterator is correct.
         let upper_iter = ConcatenatingIterator::new_and_seek_to_first(upper_ssts)
-            .map_err(|_| OrchestrationError::CompactionFailure)?;
+            .map_err(|e| OrchestrationError::CompactionFailure(e))?;
 
         if lower_ssts.is_empty() {
             return self.compact_and_build_sst(upper_iter, compact_to_bottom);
         }
 
         let lower_iter = ConcatenatingIterator::new_and_seek_to_first(lower_ssts)
-            .map_err(|_| OrchestrationError::CompactionFailure)?;
-
+            .map_err(|e| OrchestrationError::CompactionFailure(e))?;
         let iter = MultiMergeIterator::new(upper_iter, lower_iter);
         self.compact_and_build_sst(iter, compact_to_bottom)
     }

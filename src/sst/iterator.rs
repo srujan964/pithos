@@ -194,6 +194,9 @@ impl Iterator for ConcatenatingIterator {
 
         item.or_else(|| {
             self.sst_idx += 1;
+            if self.sst_idx >= self.sstables.len() {
+                return None;
+            }
             self.current = Some(SSTableIterator::new(self.sstables[self.sst_idx].clone()));
 
             self.current.as_mut().and_then(StorageIter::next)
