@@ -1,5 +1,9 @@
+#![allow(dead_code)]
+
 pub mod api;
 pub use compaction::CompactionOptions;
+pub use compaction::level::LeveledCompactionOptions;
+
 mod block;
 mod compaction;
 mod core;
