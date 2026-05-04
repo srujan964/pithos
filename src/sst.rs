@@ -197,9 +197,10 @@ impl SSTableData {
         let data = match (index.first_key(), index.last_key()) {
             (Some(first), Some(last)) => {
                 let mut block_offsets: Vec<u64> = vec![];
-                block_offsets.push(0);
+                let mut cumulative: u64 = 0;
                 for block in blocks.iter() {
-                    block_offsets.push(block.size() as u64);
+                    block_offsets.push(cumulative);
+                    cumulative += block.size() as u64;
                 }
 
                 let meta = MetaBlock {
@@ -381,20 +382,20 @@ impl SSTable {
             None => return Err(SSTableError::InvalidBlock),
         };
 
-        let next_offset: u64 = if block_idx == self.meta.block_offsets.len() {
+        let next_offset: u64 = if block_idx + 1 >= self.meta.block_offsets.len() {
             self.index.start
         } else {
-            *self.meta.block_offsets.get(block_idx + 1).unwrap()
+            self.meta.block_offsets[block_idx + 1]
         };
         let block_size = (next_offset - block_start) as usize;
 
         let num_entries = *self.meta.count_per_blk.get(block_idx).unwrap();
         let offset_data_size: usize = U16_SIZE * (num_entries as usize);
-        let offset_data_start = next_offset - offset_data_size as u64;
+        let offset_data_start = block_size - offset_data_size;
         let block_info = BlockInfo::new(block_idx, block_start, block_size as u64);
 
         let block =
-            self.load_block(block_info, offset_data_start as usize, num_entries as usize)?;
+            self.load_block(block_info, offset_data_start, num_entries as usize)?;
 
         match BlockIterator::new(Arc::new(block)) {
             Ok(iter) => Ok(iter),

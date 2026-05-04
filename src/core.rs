@@ -472,7 +472,31 @@ where
 
     // Freeze current memtable and continously flush all frozen memtables to disk.
     pub(crate) fn force_flush_all(&self) -> Result<(), OrchestrationError> {
-        let _ = self.try_freeze();
+        // Always freeze the active memtable so it gets flushed, even when it
+        // hasn't reached max_memtable_size (try_freeze is size-gated).
+        {
+            let state_lock = self.freeze_lock.lock().unwrap();
+            let state = self.state.load_full();
+            if state.memtable.size() > 0 {
+                let memtable: B = B::create(
+                    self.next_memtable_id(),
+                    Some(TableOptions::new(
+                        self.options.max_memtable_size,
+                        &self.options.data_dir,
+                    )),
+                );
+                let new_memtable_id = memtable.id();
+                let new_state = state.freeze(&state_lock, memtable);
+                match self
+                    .manifest
+                    .add_record(ManifestRecord::NewMemtable(new_memtable_id))
+                {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("Failed to write new memtable record into manifest: {e}"),
+                };
+                self.state.store(Arc::new(new_state));
+            }
+        }
 
         let state_lock = self.freeze_lock.lock().unwrap();
         let mut state = self.state.load_full();
