@@ -310,12 +310,11 @@ where
 
             // Look through all L0 files
             for id in &state.level_zero {
-                if let Some(sst) = state.sstables.get(id) {
-                    if sst.probe(&key) {
-                        if let Ok(v) = sst.fetch(&key) {
-                            return Ok(v);
-                        }
-                    }
+                if let Some(sst) = state.sstables.get(id)
+                    && sst.probe(&key)
+                    && let Ok(v) = sst.fetch(&key)
+                {
+                    return Ok(v);
                 }
             }
 
@@ -326,11 +325,12 @@ where
                         if !sst.contains(&key) {
                             continue;
                         }
-                        if sst.probe(&key) {
-                            if let Ok(v) = sst.fetch(&key) {
-                                return Ok(v);
-                            }
+                        if sst.probe(&key)
+                            && let Ok(v) = sst.fetch(&key)
+                        {
+                            return Ok(v);
                         }
+
                         break;
                     }
                 }
