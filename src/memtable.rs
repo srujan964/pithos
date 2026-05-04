@@ -2,6 +2,7 @@ use crate::block;
 use crate::iterator::StorageIter;
 use crate::sst::{self, SSTable};
 use crate::types::Value;
+use crate::wal::{Op, WalError, WalWriter};
 
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
@@ -49,18 +50,23 @@ pub(crate) struct Memtable {
     pub(crate) store: Arc<SkipMap<Bytes, Value>>,
     options: TableOptions,
     wal_dir: PathBuf,
+    wal_writer: WalWriter,
 }
 
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum MemError {
     #[error("WAL directory initialization failure")]
     WalInitFailure(#[from] std::io::Error),
+    #[error("Unable to log operation to WAL")]
+    WalWriteFailure(#[from] WalError),
     #[error("Invalid range key")]
     InvalidRange,
     #[error("Unable to freeze memtable")]
     FreezeFailure,
     #[error("Memtable size limit exceeded")]
     MaxSizeExceeded,
+    #[error("Failed to delete WAL directory")]
+    WalCleanupFailure,
 }
 
 fn create_wal_dir(path: &Path) -> Result<(), MemError> {
@@ -68,6 +74,16 @@ fn create_wal_dir(path: &Path) -> Result<(), MemError> {
         Ok(wal_dir_exists) if wal_dir_exists => Ok(()),
         Ok(_) => Ok(std::fs::create_dir_all(path)?),
         Err(e) => Err(MemError::WalInitFailure(e)),
+    }
+}
+
+impl Memtable {
+    pub(crate) fn wal_dir(&self) -> &Path {
+        &self.wal_dir
+    }
+
+    fn remove_wal_files(&self) -> Result<(), MemError> {
+        std::fs::remove_dir_all(&self.wal_dir).map_err(|_| MemError::WalCleanupFailure)
     }
 }
 
@@ -102,6 +118,11 @@ impl Buffer for Memtable {
             Err(e) => panic!("Failed to create memtable: {e}"),
         }
 
+        let writer = match WalWriter::open(&wal_dir) {
+            Ok(wal_writer) => wal_writer,
+            Err(e) => panic!("Failed to create WAL writer for memtable: {e}"),
+        };
+
         Memtable {
             id,
             max_size: options.max_size,
@@ -109,6 +130,7 @@ impl Buffer for Memtable {
             size: Arc::new(0.into()),
             options: options.clone(),
             wal_dir,
+            wal_writer: writer,
         }
     }
 
@@ -121,6 +143,9 @@ impl Buffer for Memtable {
     }
 
     fn put(&self, key: &Bytes, value: &Bytes) -> Result<usize, MemError> {
+        let op = Op::Put(key.to_vec(), value.to_vec());
+        self.wal_writer.write(&op)?;
+
         let pair_size: usize = key.len() + value.len();
         self.size.fetch_add(pair_size, Ordering::SeqCst);
         self.store.insert(key.clone(), Value::Plain(value.clone()));
@@ -135,6 +160,9 @@ impl Buffer for Memtable {
     }
 
     fn delete(&self, key: &Bytes) -> Result<(), MemError> {
+        let op = Op::Delete(key.to_vec());
+        self.wal_writer.write(&op)?;
+
         self.size.fetch_add(key.len(), Ordering::Relaxed);
         self.store.insert(key.clone(), Value::Tombstone);
         Ok(())
@@ -146,7 +174,6 @@ impl Buffer for Memtable {
 
     fn flush(&self, path: PathBuf) -> Result<SSTable, MemError> {
         let iter = MemtableIterator::from_map(self.store.clone());
-
         sst::build_sstable(self.id, iter, block::BLOCK_SIZE, path, false)
             .map_err(|_| MemError::FreezeFailure)
     }

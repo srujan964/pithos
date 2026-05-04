@@ -1,6 +1,7 @@
 use crate::compaction::{CompactionOptions, level::LeveledCompactionOptions};
 use crate::iterator::CombinedIterator;
 use crate::iterator::merge_iterator::{MergeIterator, MultiMergeIterator};
+use crate::manifest::{MANIFEST_FILE, Manifest, ManifestRecord};
 use crate::memtable::{self, Buffer, MemtableIterator, TableOptions};
 use crate::sst::iterator::{ConcatenatingIterator, SSTableIterator};
 use crate::sst::{SST_FILE_PREFIX, SSTable};
@@ -9,9 +10,9 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 
 use std::any::Any;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Debug;
-use std::fs::File;
+use std::fs::{File, OpenOptions, create_dir};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -176,6 +177,7 @@ pub(crate) struct CoreStorageInner<B> {
     cur_memtable_id: AtomicUsize,
     pub(crate) state: Arc<ArcSwap<State<B>>>,
     freeze_lock: Mutex<()>,
+    manifest: Manifest,
     pub(crate) options: CoreOptions,
 }
 
@@ -200,11 +202,11 @@ where
     B: Buffer + Clone + Send + Sync + 'static,
 {
     pub(crate) fn open(options: Option<CoreOptions>) -> Self {
-        let memtable_id = 1;
+        let mut memtable_id = 1;
         let options = options.unwrap_or_default();
         let table_options = TableOptions::new(options.max_memtable_size, &options.data_dir);
         let memtable = B::create(memtable_id, Some(table_options));
-        let state = State {
+        let mut state = State {
             memtable: Arc::new(memtable),
             frozen: VecDeque::new(),
             level_zero: vec![],
@@ -215,9 +217,56 @@ where
             },
             sstables: HashMap::new(),
         };
+
+        let manifest = if options.data_dir.join(MANIFEST_FILE).exists() {
+            match Manifest::recover(&options.data_dir) {
+                Ok((manifest, records)) => {
+                    let mut memtables: BTreeSet<usize> = BTreeSet::new();
+
+                    for record in records {
+                        match record {
+                            ManifestRecord::Flush(sst_id) => {
+                                memtables.remove(&sst_id);
+                                state.level_zero.insert(0, sst_id);
+                                memtable_id = memtable_id.max(sst_id);
+                            }
+                            ManifestRecord::NewMemtable(id) => {
+                                memtable_id = memtable_id.max(id);
+                                memtables.insert(id);
+                            }
+                            ManifestRecord::CompactionResult(compaction_task, output) => {
+                                let (new_state, _) = Self::apply_compaction_result(
+                                    &state,
+                                    &compaction_task,
+                                    &output,
+                                );
+
+                                state = new_state;
+                                memtable_id =
+                                    memtable_id.max(*output.iter().max().unwrap_or(&1usize));
+                            }
+                        }
+                    }
+
+                    manifest
+                }
+                Err(_) => create_fresh_manifest(&options.data_dir),
+            }
+        } else {
+            create_fresh_manifest(&options.data_dir)
+        };
+
+        Self::open_all_ssts(&mut state, &options);
+
+        match manifest.add_record(ManifestRecord::NewMemtable(memtable_id)) {
+            Ok(_) => {}
+            Err(e) => eprintln!("Failed to write record to manifest: {e}"),
+        };
+
         Self {
             cur_memtable_id: AtomicUsize::new(memtable_id),
             state: Arc::new(ArcSwap::new(Arc::new(state))),
+            manifest,
             freeze_lock: Mutex::new(()),
             options: options.clone(),
         }
@@ -354,8 +403,16 @@ where
                     &self.options.data_dir,
                 )),
             );
+            let new_memtable_id = memtable.id();
 
             let new_state = self.state.load_full().freeze(&state_lock, memtable);
+            match self
+                .manifest
+                .add_record(ManifestRecord::NewMemtable(new_memtable_id))
+            {
+                Ok(_) => {}
+                Err(e) => eprintln!("Failed to write new memtable record into manifest: {e}"),
+            };
             self.state.store(Arc::new(new_state));
         }
 
@@ -404,6 +461,11 @@ where
             }
         };
 
+        match self.manifest.add_record(ManifestRecord::Flush(sst.id())) {
+            Ok(_) => {}
+            Err(e) => eprintln!("Failed to write new memtable flush to manifest: {e}"),
+        };
+
         state.flush_oldest(sst).map(|updated| {
             self.state.swap(Arc::new(updated));
         })
@@ -424,7 +486,7 @@ where
         let ssts_to_remove = {
             let _state_lock = self.freeze_lock.lock().unwrap();
             let (mut new_state, files_to_remove) =
-                self.apply_compaction_result(&self.state.load_full(), &task, &new_sst_ids);
+                Self::apply_compaction_result(&self.state.load_full(), &task, &new_sst_ids);
 
             let mut ssts_to_remove = Vec::with_capacity(files_to_remove.len());
 
@@ -441,6 +503,13 @@ where
                 new_state.sstables.insert(file_to_add.id(), file_to_add);
             }
             self.state.swap(Arc::new(new_state));
+            let manifest_record = ManifestRecord::CompactionResult(task, new_sst_ids);
+
+            match self.manifest.add_record(manifest_record) {
+                Ok(_) => {}
+                Err(e) => eprintln!("Failed to write compaction info to manifest: {e}"),
+            };
+
             ssts_to_remove
         };
         println!(
@@ -505,6 +574,35 @@ where
     fn sst_path(path: impl AsRef<Path>, id: usize) -> PathBuf {
         path.as_ref()
             .join(format!("{}-{:05}.sst", SST_FILE_PREFIX, id))
+    }
+
+    fn open_all_ssts(state: &mut State<B>, options: &CoreOptions) {
+        for sst_id in state
+            .level_zero
+            .iter()
+            .chain(state.levels.iter().flat_map(|(l, ids)| ids))
+        {
+            let id = *sst_id;
+            let filepath = Self::sst_path(&options.data_dir, id);
+            let file = OpenOptions::new()
+                .read(true)
+                .open(&filepath)
+                .expect("SST file should be found at this path");
+
+            match SSTable::open(id, &filepath, Arc::new(file)) {
+                Ok(sst) => {
+                    state.sstables.insert(id, Arc::new(sst));
+                }
+                Err(e) => eprintln!("Unable to open SST file: {e}"),
+            };
+        }
+    }
+}
+
+fn create_fresh_manifest(data_dir: &Path) -> Manifest {
+    match Manifest::create(data_dir) {
+        Ok(manifest) => manifest,
+        Err(e) => panic!("Unable to create manifest file. Original error: {e}"),
     }
 }
 
@@ -715,7 +813,7 @@ mod tests {
         };
 
         let storage = CoreStorageInner {
-            cur_memtable_id: AtomicUsize::new(1),
+            cur_memtable_id: AtomicUsize::new(3),
             state: Arc::new(ArcSwap::new(Arc::new(state))),
             freeze_lock: Mutex::new(()),
             options: CoreOptions {
@@ -724,6 +822,7 @@ mod tests {
                 memtable_limit: 3,
                 compaction_opts: CompactionOptions::default(),
             },
+            manifest: Manifest::create(path).unwrap(),
         };
 
         let result = storage.force_flush_all();
@@ -775,7 +874,7 @@ mod tests {
 
         let tempdir = TempDir::new().unwrap();
         let storage = CoreStorageInner {
-            cur_memtable_id: AtomicUsize::new(1),
+            cur_memtable_id: AtomicUsize::new(3),
             state: Arc::new(ArcSwap::new(Arc::new(state))),
             freeze_lock: Mutex::new(()),
             options: CoreOptions {
@@ -784,6 +883,7 @@ mod tests {
                 memtable_limit: 3,
                 compaction_opts: CompactionOptions::default(),
             },
+            manifest: Manifest::create(path).unwrap(),
         };
 
         let iter = storage.scan(key.clone(), key_3.clone());
@@ -845,7 +945,7 @@ mod tests {
         };
 
         let storage = CoreStorageInner {
-            cur_memtable_id: AtomicUsize::new(1),
+            cur_memtable_id: AtomicUsize::new(3),
             state: Arc::new(ArcSwap::new(Arc::new(state))),
             freeze_lock: Mutex::new(()),
             options: CoreOptions {
@@ -854,6 +954,7 @@ mod tests {
                 memtable_limit: 3,
                 compaction_opts: CompactionOptions::default(),
             },
+            manifest: Manifest::create(path).unwrap(),
         };
 
         let _ = storage.force_flush_all();

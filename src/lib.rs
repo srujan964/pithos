@@ -6,6 +6,7 @@ mod core;
 mod filter;
 mod index;
 mod iterator;
+mod manifest;
 mod memtable;
 mod sst;
 mod types;

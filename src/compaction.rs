@@ -5,6 +5,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     block,
@@ -35,7 +36,7 @@ impl Default for CompactionOptions {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) enum CompactionTask {
     Level(level::Task),
 }
@@ -190,7 +191,6 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorageInner<B> {
     }
 
     pub(crate) fn apply_compaction_result(
-        &self,
         state: &State<B>,
         task: &CompactionTask,
         output: &[usize],

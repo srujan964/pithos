@@ -10,7 +10,7 @@ const WAL_FILE_EXT: &str = ".log";
 const MAX_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
-enum Op {
+pub(crate) enum Op {
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
 }
@@ -46,7 +46,7 @@ struct WalEntry {
 }
 
 #[derive(Debug, Clone)]
-struct WalWriter {
+pub(crate) struct WalWriter {
     current_segment: Arc<usize>,
     file: Arc<Mutex<BufWriter<File>>>,
     max_segment_size: usize,
@@ -54,7 +54,7 @@ struct WalWriter {
 }
 
 #[derive(thiserror::Error, Debug)]
-enum WalError {
+pub(crate) enum WalError {
     #[error("Failed to initalize WAL")]
     InitFailed,
     #[error("Unable to write WAL entry")]
@@ -71,7 +71,7 @@ impl WalWriter {
             .read(true)
             .append(true)
             .create_new(true)
-            .open(segment_path)
+            .open(&segment_path)
         {
             Ok(Self {
                 current_segment: Arc::new(segment_no),
@@ -80,6 +80,10 @@ impl WalWriter {
                 wal_dir: path.to_path_buf(),
             })
         } else {
+            eprintln!(
+                "Attempted to create WAL file that already exists in path: {:?}",
+                &segment_path
+            );
             Err(WalError::InitFailed)
         }
     }

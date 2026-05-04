@@ -233,12 +233,10 @@ impl SSTableData {
         let mut data = data?;
         let mut writer = WriteableSSTable::create(&path)?;
 
-        let bytes_written = writer.write(&mut data)?;
+        let _bytes_written = writer.write(&mut data)?;
         let read_only_file = OpenOptions::new().read(true).open(&path)?;
 
-        eprintln!("{} bytes written to file {:?}", bytes_written, &path);
         let sst = SSTable::open(id, &path, Arc::new(read_only_file))?;
-
         Ok(sst)
     }
 }
