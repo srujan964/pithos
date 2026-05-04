@@ -121,7 +121,7 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorageInner<B> {
     pub(crate) fn generate_compaction_task(&self, state: &State<B>) -> Option<CompactionTask> {
         match &self.options.compaction_opts {
             CompactionOptions::Leveled(opts) => {
-                let task = level::pick_compaction(state, &opts)?;
+                let task = level::pick_compaction(state, opts)?;
                 Some(CompactionTask::Level(task))
             }
         }

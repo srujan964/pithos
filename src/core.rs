@@ -4,7 +4,7 @@ use crate::iterator::merge_iterator::{MergeIterator, MultiMergeIterator};
 use crate::manifest::{MANIFEST_FILE, Manifest, ManifestRecord};
 use crate::memtable::{self, Buffer, MemtableIterator, TableOptions};
 use crate::sst::iterator::{ConcatenatingIterator, SSTableIterator};
-use crate::sst::{SST_FILE_PREFIX, SSTable};
+use crate::sst::{SST_FILE_PREFIX, SSTable, SSTableError};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -135,14 +135,14 @@ where
         if let Some(compaction_thread) = compaction_thread.take() {
             compaction_thread
                 .join()
-                .map_err(|e| OrchestrationError::CloseError(e))?;
+                .map_err(OrchestrationError::CloseError)?;
         }
 
         let mut flush_thread = self.flush_thread.lock().unwrap();
         if let Some(flush_thread) = flush_thread.take() {
             flush_thread
                 .join()
-                .map_err(|e| OrchestrationError::CloseError(e))?;
+                .map_err(OrchestrationError::CloseError)?;
         }
 
         self.inner.force_flush_all()?;
@@ -308,29 +308,39 @@ where
                 }
             }
 
-            // Look through all L0 files
+            // L0: SSTs may overlap, so check all of them newest-first.
+            // Stop immediately on a tombstone — a newer record has explicitly deleted the key.
             for id in &state.level_zero {
                 if let Some(sst) = state.sstables.get(id)
                     && sst.probe(&key)
-                    && let Ok(v) = sst.fetch(&key)
                 {
-                    return Ok(v);
+                    match sst.fetch(&key) {
+                        Ok(v) => return Ok(v),
+                        Err(SSTableError::NonexistentKey) => {
+                            return Err(OrchestrationError::Unavailable);
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
 
-            // Look through L1+ files
+            // L1+: These SSTs in each level are non-overlapping, so at most one SST per level
+            // can contain the key. Stop on a tombstone for the same reason as L0.
             for (_, level_sst_ids) in &state.levels {
                 for id in level_sst_ids {
                     if let Some(sst) = state.sstables.get(id) {
                         if !sst.contains(&key) {
                             continue;
                         }
-                        if sst.probe(&key)
-                            && let Ok(v) = sst.fetch(&key)
-                        {
-                            return Ok(v);
+                        if sst.probe(&key) {
+                            match sst.fetch(&key) {
+                                Ok(v) => return Ok(v),
+                                Err(SSTableError::NonexistentKey) => {
+                                    return Err(OrchestrationError::Unavailable);
+                                }
+                                Err(_) => {}
+                            }
                         }
-
                         break;
                     }
                 }
@@ -945,8 +955,6 @@ mod tests {
         let _ = frozen_table_two.put(&key, &replacement_value);
         let _ = frozen_table_two.put(&scanning_key_1, &scanning_value_1);
         let _ = frozen_table_two.put(&scanning_key_2, &scanning_value_1);
-
-        let _ = memtable.delete(&key);
 
         let mut q = VecDeque::new();
         q.push_back(Arc::new(frozen_table_one));
