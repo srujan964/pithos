@@ -150,12 +150,15 @@ pub mod storage {
     }
 
     impl std::iter::Iterator for crate::api::storage::Iterator {
-        type Item = (Vec<u8>, Vec<u8>);
+        type Item = (Vec<u8>, Value);
 
         fn next(&mut self) -> Option<Self::Item> {
             match self.inner.next() {
                 Some((k, v)) => match v {
-                    crate::types::Value::Plain(v) => Some((k.to_vec(), v.to_vec())),
+                    crate::types::Value::Plain(v) => match Value::from_bytes(v.to_vec()) {
+                        Ok(value) => Some((k.to_vec(), value)),
+                        Err(_) => None,
+                    },
                     crate::types::Value::Tombstone => unreachable!(),
                 },
                 None => None,
