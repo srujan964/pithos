@@ -202,69 +202,72 @@ where
     B: Buffer + Clone + Send + Sync + 'static,
 {
     pub(crate) fn open(options: Option<CoreOptions>) -> Self {
-        let mut memtable_id = 1;
         let options = options.unwrap_or_default();
         let table_options = TableOptions::new(options.max_memtable_size, &options.data_dir);
-        let memtable = B::create(memtable_id, Some(table_options));
+
+        let (manifest, records) = if options.data_dir.join(MANIFEST_FILE).exists() {
+            match Manifest::recover(&options.data_dir) {
+                Ok(result) => result,
+                Err(_) => (create_fresh_manifest(&options.data_dir), vec![]),
+            }
+        } else {
+            (create_fresh_manifest(&options.data_dir), vec![])
+        };
+
+        // Get the latest memtable ID from the manifest first.
+        let mut memtable_id = 0usize;
+        for record in &records {
+            match record {
+                ManifestRecord::Flush(sst_id) => {
+                    memtable_id = memtable_id.max(*sst_id);
+                }
+                ManifestRecord::NewMemtable(id) => {
+                    memtable_id = memtable_id.max(*id);
+                }
+                ManifestRecord::CompactionResult(_, output) => {
+                    memtable_id = memtable_id.max(*output.iter().max().unwrap_or(&0));
+                }
+            }
+        }
+
+        let new_memtable_id = memtable_id + 1;
+        let memtable = B::create(new_memtable_id, Some(table_options));
+
         let mut state = State {
             memtable: Arc::new(memtable),
             frozen: VecDeque::new(),
             level_zero: vec![],
-            levels: match options.compaction_opts {
+            levels: match &options.compaction_opts {
                 CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. }) => {
-                    (0..max_levels).map(|l| (l, vec![])).collect()
+                    (0..*max_levels).map(|l| (l, vec![])).collect()
                 }
             },
             sstables: HashMap::new(),
         };
 
-        let manifest = if options.data_dir.join(MANIFEST_FILE).exists() {
-            match Manifest::recover(&options.data_dir) {
-                Ok((manifest, records)) => {
-                    let mut memtables: BTreeSet<usize> = BTreeSet::new();
-
-                    for record in records {
-                        match record {
-                            ManifestRecord::Flush(sst_id) => {
-                                memtables.remove(&sst_id);
-                                state.level_zero.insert(0, sst_id);
-                                memtable_id = memtable_id.max(sst_id);
-                            }
-                            ManifestRecord::NewMemtable(id) => {
-                                memtable_id = memtable_id.max(id);
-                                memtables.insert(id);
-                            }
-                            ManifestRecord::CompactionResult(compaction_task, output) => {
-                                let (new_state, _) = Self::apply_compaction_result(
-                                    &state,
-                                    &compaction_task,
-                                    &output,
-                                );
-
-                                state = new_state;
-                                memtable_id =
-                                    memtable_id.max(*output.iter().max().unwrap_or(&1usize));
-                            }
-                        }
-                    }
-
-                    manifest
+        for record in records {
+            match record {
+                ManifestRecord::Flush(sst_id) => {
+                    state.level_zero.insert(0, sst_id);
                 }
-                Err(_) => create_fresh_manifest(&options.data_dir),
+                ManifestRecord::NewMemtable(_) => {}
+                ManifestRecord::CompactionResult(compaction_task, output) => {
+                    let (new_state, _) =
+                        Self::apply_compaction_result(&state, &compaction_task, &output);
+                    state = new_state;
+                }
             }
-        } else {
-            create_fresh_manifest(&options.data_dir)
-        };
+        }
 
         Self::open_all_ssts(&mut state, &options);
 
-        match manifest.add_record(ManifestRecord::NewMemtable(memtable_id)) {
+        match manifest.add_record(ManifestRecord::NewMemtable(new_memtable_id)) {
             Ok(_) => {}
             Err(e) => eprintln!("Failed to write record to manifest: {e}"),
         };
 
         Self {
-            cur_memtable_id: AtomicUsize::new(memtable_id),
+            cur_memtable_id: AtomicUsize::new(new_memtable_id),
             state: Arc::new(ArcSwap::new(Arc::new(state))),
             manifest,
             freeze_lock: Mutex::new(()),
