@@ -10,7 +10,7 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions, create_dir};
 use std::ops::Bound;
@@ -305,19 +305,31 @@ where
                 }
             }
 
-            let sst_ids: Vec<_> = state.level_zero.iter().collect();
-
-            for id in sst_ids {
-                let found = match state.sstables.get(id) {
-                    Some(sst) if sst.probe(&key) => {
-                        sst.fetch(&key).map_err(|_| OrchestrationError::Unavailable)
+            // Look through all L0 files
+            for id in &state.level_zero {
+                if let Some(sst) = state.sstables.get(id) {
+                    if sst.probe(&key) {
+                        if let Ok(v) = sst.fetch(&key) {
+                            return Ok(v);
+                        }
                     }
-                    Some(_sst) => Err(OrchestrationError::Unavailable),
-                    None => Err(OrchestrationError::Unavailable),
-                };
+                }
+            }
 
-                if found.is_ok() {
-                    return found;
+            // Look through L1+ files
+            for (_, level_sst_ids) in &state.levels {
+                for id in level_sst_ids {
+                    if let Some(sst) = state.sstables.get(id) {
+                        if !sst.contains(&key) {
+                            continue;
+                        }
+                        if sst.probe(&key) {
+                            if let Ok(v) = sst.fetch(&key) {
+                                return Ok(v);
+                            }
+                        }
+                        break;
+                    }
                 }
             }
 
