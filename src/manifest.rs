@@ -3,6 +3,7 @@ use std::{
     io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::SystemTime,
 };
 
 use bytes::Buf;
@@ -32,7 +33,8 @@ pub(crate) enum ManifestError {
 pub(crate) enum ManifestRecord {
     Flush(usize),
     NewMemtable(usize),
-    CompactionResult(CompactionTask, Vec<usize>),
+    CompactionStart(CompactionTask, SystemTime),
+    CompactionResult(CompactionTask, Vec<usize>, SystemTime),
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +103,8 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use pretty_assertions::assert_eq;
     use temp_dir::TempDir;
 
@@ -128,7 +132,8 @@ mod tests {
             overlapping_ssts: vec![2, 3],
         };
         let compaction_task = CompactionTask::Level(task);
-        let compaction_record = ManifestRecord::CompactionResult(compaction_task, vec![2, 3, 4]);
+        let compaction_record =
+            ManifestRecord::CompactionResult(compaction_task, vec![2, 3, 4], SystemTime::now());
         manifest.add_record(compaction_record.clone())?;
 
         let (_, records) = Manifest::recover(dir_path)?;

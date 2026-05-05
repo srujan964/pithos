@@ -20,7 +20,7 @@ use std::sync::{
     Arc, Mutex, MutexGuard,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::vec;
 
 pub(crate) const DATA_DIR: &str = "/usr/local/pithos/data";
@@ -232,7 +232,8 @@ where
                     memtable_id = memtable_id.max(*id);
                     unflushed.insert(*id);
                 }
-                ManifestRecord::CompactionResult(_, output) => {
+                ManifestRecord::CompactionStart(_, _) => {}
+                ManifestRecord::CompactionResult(_, output, _) => {
                     memtable_id = memtable_id.max(*output.iter().max().unwrap_or(&0));
                 }
             }
@@ -280,7 +281,8 @@ where
                     state.level_zero.insert(0, sst_id);
                 }
                 ManifestRecord::NewMemtable(_) => {}
-                ManifestRecord::CompactionResult(compaction_task, output) => {
+                ManifestRecord::CompactionStart(_, _) => {}
+                ManifestRecord::CompactionResult(compaction_task, output, _) => {
                     let (new_state, _) =
                         Self::apply_compaction_result(&state, &compaction_task, &output);
                     state = new_state;
@@ -570,6 +572,13 @@ where
         };
 
         let sstables = self.compact(&task)?;
+
+        let compaction_start_record =
+            ManifestRecord::CompactionStart(task.clone(), SystemTime::now());
+        match self.manifest.add_record(compaction_start_record) {
+            Ok(_) => {}
+            Err(e) => eprintln!("Failed to write compaction info to manifest: {e}"),
+        };
         let new_files = sstables.len();
         let new_sst_ids: Vec<usize> = sstables.iter().map(|sst| sst.id()).collect();
         let ssts_to_remove = {
@@ -592,9 +601,10 @@ where
                 new_state.sstables.insert(file_to_add.id(), file_to_add);
             }
             self.state.swap(Arc::new(new_state));
-            let manifest_record = ManifestRecord::CompactionResult(task, new_sst_ids);
+            let compaction_result_record =
+                ManifestRecord::CompactionResult(task, new_sst_ids, SystemTime::now());
 
-            match self.manifest.add_record(manifest_record) {
+            match self.manifest.add_record(compaction_result_record) {
                 Ok(_) => {}
                 Err(e) => eprintln!("Failed to write compaction info to manifest: {e}"),
             };
