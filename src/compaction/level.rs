@@ -153,7 +153,6 @@ pub(crate) fn pick_compaction<B: Buffer + Clone + Sync + Send + 'static>(
 mod tests {
     use std::{
         collections::{HashMap, VecDeque},
-        fmt,
         fs::OpenOptions,
         ops::Bound,
         path::{Path, PathBuf},

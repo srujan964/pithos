@@ -2,6 +2,7 @@
 
 pub mod api;
 pub use compaction::CompactionOptions;
+pub use compaction::fifo::FIFOCompactionOptions;
 pub use compaction::level::LeveledCompactionOptions;
 
 mod block;

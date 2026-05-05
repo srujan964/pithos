@@ -1,4 +1,4 @@
-use crate::compaction::{CompactionOptions, level::LeveledCompactionOptions};
+use crate::compaction::{CompactionOptions, fifo, level::LeveledCompactionOptions};
 use crate::iterator::CombinedIterator;
 use crate::iterator::merge_iterator::{MergeIterator, MultiMergeIterator};
 use crate::manifest::{MANIFEST_FILE, Manifest, ManifestRecord};
@@ -267,6 +267,9 @@ where
                 CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. }) => {
                     (0..*max_levels).map(|l| (l, vec![])).collect()
                 }
+                CompactionOptions::Tiered(fifo::FIFOCompactionOptions { cold, .. }) => {
+                    (0..cold.max_levels).map(|l| (l, vec![])).collect()
+                }
             },
             sstables: HashMap::new(),
         };
@@ -286,6 +289,17 @@ where
         }
 
         Self::open_all_ssts(&mut state, &options);
+
+        // Restore first_key ordering across all levels.
+        let sstables = &state.sstables;
+        for (_, ids) in &mut state.levels {
+            ids.sort_by_key(|id| {
+                sstables
+                    .get(id)
+                    .map(|s| s.first_key().to_vec())
+                    .unwrap_or_default()
+            });
+        }
 
         match manifest.add_record(ManifestRecord::NewMemtable(new_memtable_id)) {
             Ok(_) => {}

@@ -11,17 +11,25 @@ use crate::{
     block,
     compaction::level::LeveledCompactionOptions,
     core::{CoreStorageInner, OrchestrationError, State},
-    iterator::{StorageIter, merge_iterator::{MergeIterator, MultiMergeIterator}},
+    iterator::{
+        StorageIter,
+        merge_iterator::{MergeIterator, MultiMergeIterator},
+    },
     memtable::Buffer,
-    sst::{self, SSTable, iterator::{ConcatenatingIterator, SSTableIterator}},
+    sst::{
+        self, SSTable,
+        iterator::{ConcatenatingIterator, SSTableIterator},
+    },
     types::Value,
 };
 
+pub mod fifo;
 pub mod level;
 
 #[derive(Clone, Debug)]
 pub enum CompactionOptions {
     Leveled(LeveledCompactionOptions),
+    Tiered(fifo::FIFOCompactionOptions),
 }
 
 impl Default for CompactionOptions {
@@ -39,6 +47,7 @@ impl Default for CompactionOptions {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) enum CompactionTask {
     Level(level::Task),
+    Tiered(fifo::TieredTask),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,6 +133,10 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorageInner<B> {
                 let task = level::pick_compaction(state, opts)?;
                 Some(CompactionTask::Level(task))
             }
+            CompactionOptions::Tiered(opts) => {
+                let task = fifo::pick_compaction(state, opts)?;
+                Some(CompactionTask::Tiered(task))
+            }
         }
     }
 
@@ -158,9 +171,37 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorageInner<B> {
         &self,
         task: &CompactionTask,
     ) -> Result<Vec<Arc<SSTable>>, OrchestrationError> {
-        let CompactionTask::Level(task) = task;
+        match task {
+            CompactionTask::Level(task) => {
+                let CompactionOptions::Leveled(opts) = &self.options.compaction_opts else {
+                    return Err(OrchestrationError::CompactionFailedToBuildSST);
+                };
+                self.compact_sst_files(task, opts.max_levels)
+            }
+            CompactionTask::Tiered(tiered_task) => {
+                let CompactionOptions::Tiered(opts) = &self.options.compaction_opts else {
+                    return Err(OrchestrationError::CompactionFailedToBuildSST);
+                };
+                match tiered_task {
+                    fifo::TieredTask::Promote { .. } | fifo::TieredTask::ColdEvict { .. } => {
+                        Ok(vec![])
+                    }
+                    fifo::TieredTask::HotMerge { files } => self.compact_hot_merge(files),
+                    fifo::TieredTask::ColdCompact(level_task) => {
+                        self.compact_sst_files(level_task, opts.cold.max_levels)
+                    }
+                }
+            }
+        }
+    }
+
+    // Shared compaction logic for both leveled (Level task) and cold leveled (ColdCompact).
+    fn compact_sst_files(
+        &self,
+        task: &level::Task,
+        max_levels: usize,
+    ) -> Result<Vec<Arc<SSTable>>, OrchestrationError> {
         let state = self.state.load_full();
-        let CompactionOptions::Leveled(opts) = &self.options.compaction_opts;
 
         let upper_ssts: Vec<_> = task
             .files_to_compact
@@ -174,12 +215,11 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorageInner<B> {
             .filter_map(|id| state.sstables.get(id).cloned())
             .collect();
 
-        let compact_to_bottom = task.next_level == opts.max_levels;
+        let compact_to_bottom = task.next_level == max_levels;
 
         if task.input_level.is_none() {
-            // L0 SSTs can overlap: use a heap-based merge iterator.
-            // files_to_compact preserves level_zero order (newest-first), so iter_idx=0 wins
-            // on duplicate keys, which gives the correct newest-value semantics.
+            // L0 SSTs can overlap, so it needs to be iterated over with
+            // a MergeIterator<SSTableIterator>.
             let iters: VecDeque<SSTableIterator> = upper_ssts
                 .iter()
                 .map(|sst| SSTableIterator::new(sst.clone()))
@@ -191,23 +231,37 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorageInner<B> {
             }
 
             let lower_iter = ConcatenatingIterator::new_and_seek_to_first(lower_ssts)
-                .map_err(|e| OrchestrationError::CompactionFailure(e))?;
+                .map_err(OrchestrationError::CompactionFailure)?;
             let iter = MultiMergeIterator::new(upper_iter, lower_iter);
             return self.compact_and_build_sst(iter, compact_to_bottom);
         }
 
-        // L1+ SSTs within a level are non-overlapping: concatenating iterator is correct.
+        // L1+ files are non-overlapping, so we don't need a merge over each file.
         let upper_iter = ConcatenatingIterator::new_and_seek_to_first(upper_ssts)
-            .map_err(|e| OrchestrationError::CompactionFailure(e))?;
+            .map_err(OrchestrationError::CompactionFailure)?;
 
         if lower_ssts.is_empty() {
             return self.compact_and_build_sst(upper_iter, compact_to_bottom);
         }
 
         let lower_iter = ConcatenatingIterator::new_and_seek_to_first(lower_ssts)
-            .map_err(|e| OrchestrationError::CompactionFailure(e))?;
+            .map_err(OrchestrationError::CompactionFailure)?;
         let iter = MultiMergeIterator::new(upper_iter, lower_iter);
         self.compact_and_build_sst(iter, compact_to_bottom)
+    }
+
+    // Files in hot storage are assumed to be non-overlapping, so first sort them by their starting
+    // keys and then a simple concatenate.
+    fn compact_hot_merge(&self, files: &[usize]) -> Result<Vec<Arc<SSTable>>, OrchestrationError> {
+        let state = self.state.load_full();
+        let mut ssts: Vec<Arc<SSTable>> = files
+            .iter()
+            .filter_map(|id| state.sstables.get(id).cloned())
+            .collect();
+        ssts.sort_by(|a, b| a.first_key().cmp(b.first_key()));
+        let iter = ConcatenatingIterator::new_and_seek_to_first(ssts)
+            .map_err(OrchestrationError::CompactionFailure)?;
+        self.compact_and_build_sst(iter, false)
     }
 
     pub(crate) fn apply_compaction_result(
@@ -215,7 +269,19 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorageInner<B> {
         task: &CompactionTask,
         output: &[usize],
     ) -> (State<B>, Vec<usize>) {
-        let CompactionTask::Level(task) = task;
+        match task {
+            CompactionTask::Level(task) => Self::apply_level_result(state, task, output),
+            CompactionTask::Tiered(tiered_task) => {
+                Self::apply_tiered_result(state, tiered_task, output)
+            }
+        }
+    }
+
+    fn apply_level_result(
+        state: &State<B>,
+        task: &level::Task,
+        output: &[usize],
+    ) -> (State<B>, Vec<usize>) {
         let mut state = state.clone();
         let mut files_to_remove: Vec<usize> = vec![];
 
@@ -280,11 +346,52 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorageInner<B> {
         (state, files_to_remove)
     }
 
+    fn apply_tiered_result(
+        state: &State<B>,
+        task: &fifo::TieredTask,
+        output: &[usize],
+    ) -> (State<B>, Vec<usize>) {
+        match task {
+            fifo::TieredTask::Promote { files } => {
+                let mut state = state.clone();
+                let promote_set: HashSet<usize> = files.iter().copied().collect();
+                state.level_zero.retain(|id| !promote_set.contains(id));
+                state.levels[0].1.extend(files);
+                // sstables is empty during manifest replay; skip the sort here and
+                // let open_all_ssts re-sort after loading.
+                if state.levels[0].1.iter().all(|id| state.sstables.contains_key(id)) {
+                    state.levels[0].1.sort_by(|a, b| {
+                        state.sstables[a].first_key().cmp(state.sstables[b].first_key())
+                    });
+                }
+                (state, vec![])
+            }
+            fifo::TieredTask::HotMerge { files } => {
+                let mut state = state.clone();
+                let merge_set: HashSet<usize> = files.iter().copied().collect();
+                state.level_zero.retain(|id| !merge_set.contains(id));
+                state.level_zero.extend(output);
+                (state, files.clone())
+            }
+            // Cold compaction is just the standard level compaction scheme.
+            fifo::TieredTask::ColdCompact(level_task) => {
+                Self::apply_level_result(state, level_task, output)
+            }
+            fifo::TieredTask::ColdEvict { files } => {
+                let mut state = state.clone();
+                let evict_set: HashSet<usize> = files.iter().copied().collect();
+                for (_, ids) in &mut state.levels {
+                    ids.retain(|id| !evict_set.contains(id));
+                }
+                (state, files.clone())
+            }
+        }
+    }
+
     pub(crate) fn spawn_compaction_thread(
         self: &Arc<Self>,
         rx: crossbeam_channel::Receiver<()>,
     ) -> Result<Option<std::thread::JoinHandle<()>>, OrchestrationError> {
-        let CompactionOptions::Leveled(_) = self.options.compaction_opts;
         let this = self.clone();
 
         let handle = std::thread::spawn(move || {
