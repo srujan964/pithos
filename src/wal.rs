@@ -73,6 +73,8 @@ impl WalWriter {
             .create_new(true)
             .open(&segment_path)
         {
+            // Fsync the WAL directory so the new file's directory entry is durable.
+            let _ = File::open(path).and_then(|d| d.sync_all());
             Ok(Self {
                 current_segment: Arc::new(segment_no),
                 file: Arc::new(Mutex::new(BufWriter::new(wal_file))),
@@ -105,15 +107,14 @@ impl WalWriter {
         let buf = encode(WalVersion::V1, hasher.finalize(), op);
 
         let mut file = self.file.lock().unwrap();
-        match file.write(&buf) {
-            Ok(total) => Ok(total),
-            Err(_) => Err(WalError::WriteFailure),
-        }
+        file.write(&buf).map_err(|_| WalError::WriteFailure)?;
+        Ok(buf.len())
     }
 
     pub(crate) fn flush(&self) -> std::io::Result<()> {
         let mut guard = self.file.lock().unwrap();
         guard.flush()?;
+        guard.get_ref().sync_data()?;
         Ok(())
     }
 }

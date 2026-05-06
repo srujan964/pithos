@@ -51,6 +51,9 @@ impl Manifest {
             .create_new(true)
             .open(&path)?;
 
+        // Fsync the directory so the manifest file's directory entry is durable.
+        File::open(dir)?.sync_all()?;
+
         Ok(Self {
             file: Arc::new(Mutex::new(BufWriter::new(file))),
         })
@@ -63,6 +66,7 @@ impl Manifest {
         file.write_all(&len.to_le_bytes())?;
         file.write_all(&buf)?;
         file.flush()?;
+        file.get_ref().sync_data()?;
         Ok(())
     }
 

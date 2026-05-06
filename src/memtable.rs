@@ -72,7 +72,14 @@ pub(crate) enum MemError {
 fn create_wal_dir(path: &Path) -> Result<(), MemError> {
     match std::fs::exists(path) {
         Ok(wal_dir_exists) if wal_dir_exists => Ok(()),
-        Ok(_) => Ok(std::fs::create_dir_all(path)?),
+        Ok(_) => {
+            std::fs::create_dir_all(path)?;
+            // Fsync parent so the new directory entry is durable.
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
+            }
+            Ok(())
+        }
         Err(e) => Err(MemError::WalInitFailure(e)),
     }
 }

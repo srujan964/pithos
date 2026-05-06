@@ -601,6 +601,7 @@ where
                 new_state.sstables.insert(file_to_add.id(), file_to_add);
             }
             self.state.swap(Arc::new(new_state));
+            self.sync()?;
             let compaction_result_record =
                 ManifestRecord::CompactionResult(task, new_sst_ids, SystemTime::now());
 
@@ -620,6 +621,7 @@ where
         for sst in ssts_to_remove {
             let _ = std::fs::remove_file(self.get_sst_path(sst.id()));
         }
+        self.sync()?;
 
         Ok(())
     }
