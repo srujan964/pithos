@@ -583,11 +583,17 @@ where
         let new_sst_ids: Vec<usize> = sstables.iter().map(|sst| sst.id()).collect();
         let ssts_to_remove = {
             let _state_lock = self.freeze_lock.lock().unwrap();
+
+            // Pre-insert new SSTs so apply_compaction_result can sort by first_key.
+            let mut working = self.state.load_full().as_ref().clone();
+            for sst in &sstables {
+                working.sstables.insert(sst.id(), sst.clone());
+            }
+
             let (mut new_state, files_to_remove) =
-                Self::apply_compaction_result(&self.state.load_full(), &task, &new_sst_ids);
+                Self::apply_compaction_result(&working, &task, &new_sst_ids);
 
             let mut ssts_to_remove = Vec::with_capacity(files_to_remove.len());
-
             for file in &files_to_remove {
                 let removed = new_state.sstables.remove(file);
                 if let Some(id) = removed {
@@ -595,11 +601,6 @@ where
                 };
             }
 
-            let mut new_sst_ids = Vec::new();
-            for file_to_add in sstables {
-                new_sst_ids.push(file_to_add.id());
-                new_state.sstables.insert(file_to_add.id(), file_to_add);
-            }
             self.state.swap(Arc::new(new_state));
             self.sync()?;
             let compaction_result_record =

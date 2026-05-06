@@ -333,14 +333,13 @@ impl<B: Buffer + Clone + Sync + Send + 'static> CoreStorageInner<B> {
             .collect();
 
         new_lower.extend(output);
-        new_lower.sort_by(|a, b| {
-            state
-                .sstables
-                .get(a)
-                .unwrap()
-                .first_key()
-                .cmp(state.sstables.get(b).unwrap().first_key())
-        });
+        // sstables is empty during manifest replay; skip the sort here and
+        // let open_all_ssts re-sort after loading.
+        if new_lower.iter().all(|id| state.sstables.contains_key(id)) {
+            new_lower.sort_by(|a, b| {
+                state.sstables[a].first_key().cmp(state.sstables[b].first_key())
+            });
+        }
 
         state.levels[task.next_level - 1].1 = new_lower;
         (state, files_to_remove)
